@@ -218,148 +218,85 @@ class DPOCBacktester:
         direction = 0 # 1 long, -1 short
         type_str = ""
         
-        # --- Pre-calculate Metrics for Filters ---
-        # 1. HMA and Slope
+        # HMA and slope
         hma = session_data['HMA'] if 'HMA' in session_data.columns else pd.Series(index=session_data.index, data=0)
         hma_diff = hma.diff()
         
-        # 2. Rolling Body Average (for Displacement)
-        body = (session_data['Close'] - session_data['Open']).abs()
-        avg_body = body.rolling(20).mean()
-        
-        # 3. Rolling Slope Magnitude (for Flatness check)
-        slope_mag = hma_diff.abs()
-        avg_slope_mag = slope_mag.rolling(20).mean()
-
-        # Cooldown State
-        cooldown = 0
-        COOLDOWN_BARS = 10
-        
         # Iterate
         for i in range(len(session_data)):
-            if i < 20: continue # Need history for rolling metrics
+            if i < 15: continue # Let indicators stabilize
             
-            # Tick down cooldown
-            if cooldown > 0:
-                cooldown -= 1
-                if not in_trade: # Only start counting down if we are NOT in a trade? 
-                                 # Usually cooldown is "after trade closes". 
-                                 # So if we are not in trade, we decrement.
-                    pass
-                else:
-                    # If we are IN trade, cooldown doesn't matter yet. 
-                    # But the logic "after a trade closes, wait N bars" implies 
-                    # we set cooldown AFTER exit.
-                    pass
-
-            # Current Data
             row = session_data.iloc[i]
             time = session_data.index[i]
             close = row['Close']
             high = row['High']
             low = row['Low']
-            prev_close = session_data['Close'].iloc[i-1]
             
             curr_poc = pocs[i]
             curr_vah = vahs[i]
             curr_val = vals[i]
             curr_hma = hma.iloc[i]
             curr_slope = hma_diff.iloc[i]
+            prev_slope = hma_diff.iloc[i-1] if i > 0 else 0
             
             # HMA Trend
             hma_up = curr_slope > 0
             hma_down = curr_slope < 0
             
-            # Filter Checks
-            # Displacement: Body > 1.25x Average
-            is_displacement = body.iloc[i] >= 1.25 * avg_body.iloc[i]
-            
-            # Flat HMA (for Fades): Slope < Average Slope
-            is_flat = abs(curr_slope) <= avg_slope_mag.iloc[i]
-
             if not in_trade:
-                if cooldown > 0:
-                    continue
-
-                # --- STRATEGY TYPE A: Trend Continuation (With Filters) ---
-                # "Only trade trend when outside value OR reclaiming value edge"
-                
-                # Long
-                if hma_up:
-                    # Value Filter: Close > VAH OR (Reclaim: Prev < VAL and Close > VAL)
-                    reclaim_val = (prev_close < curr_val) and (close > curr_val)
-                    above_vah = close > curr_vah
+                # --- STRATEGY TYPE A: Trend Continuation ---
+                # Long: Price > POC, HMA Up, Pullback to POC/VAL
+                if close > curr_poc and hma_up:
+                    # Check Pullback near POC or VAL (within buffer)
+                    near_poc = abs(low - curr_poc) <= TP_BUFFER
+                    near_val = abs(low - curr_val) <= TP_BUFFER
                     
-                    if (above_vah or reclaim_val) and is_displacement:
-                        # Pullback check (Tighter buffer: 0.5)
-                        # "prefer pullback entry after displacement"? 
-                        # The user code snippet: "pullback_ok = (abs(low - curr_val) <= 0.5) or ..."
-                        # This implies we touched the level in THIS bar or very recently. 
-                        # Using current bar Low touch:
-                        pullback_ok = (abs(low - curr_val) <= 0.5) or (abs(low - curr_poc) <= 0.5) or (abs(low - curr_vah) <= 0.5)
-                        # Note: User code checked val/poc. If we are above VAH, maybe we pullback to VAH? 
-                        # User logic: "target_price = curr_vah if close < curr_vah..." 
-                        # Let's stick to user's "pullback_ok" logic but expand to VAH if we are above it.
-                        if above_vah:
-                             pullback_ok = (abs(low - curr_vah) <= 0.5)
-                        
-                        if pullback_ok and close > row['Open']:
-                            direction = 1
-                            entry_price = close
-                            # Stop: Below Low or Structure
-                            stop_price = min(low, curr_val) - 0.75
-                            # Target: If reclaiming VAL, target VAH. If above VAH, Runner.
-                            target_price = curr_vah if close < curr_vah else (close + 4.0) # Simple runner extension
-                            
-                            type_str = "Type A (Trend)"
-                            in_trade = True
-                            trades.append({'type': 'Long', 'entry_time': time, 'entry_price': entry_price, 'status': 'Open', 'desc': type_str})
-                            continue
-
-                # Short
-                elif hma_down:
-                    # Value Filter: Close < VAL OR (Reject: Prev > VAH and Close < VAH)
-                    reject_vah = (prev_close > curr_vah) and (close < curr_vah)
-                    below_val = close < curr_val
-                    
-                    if (below_val or reject_vah) and is_displacement:
-                        pullback_ok = (abs(high - curr_vah) <= 0.5) or (abs(high - curr_poc) <= 0.5)
-                        if below_val:
-                            pullback_ok = (abs(high - curr_val) <= 0.5)
-                            
-                        if pullback_ok and close < row['Open']:
-                            direction = -1
-                            entry_price = close
-                            stop_price = max(high, curr_vah) + 0.75
-                            target_price = curr_val if close > curr_val else (close - 4.0)
-                            
-                            type_str = "Type A (Trend)"
-                            in_trade = True
-                            trades.append({'type': 'Short', 'entry_time': time, 'entry_price': entry_price, 'status': 'Open', 'desc': type_str})
-                            continue
-
-                # --- STRATEGY TYPE B: Value Rejection/Fade (With Filters) ---
-                # Only fade if HMA is flat
-                
-                # Long Fade at VAL
-                if is_flat and low <= curr_val:
-                    # Reversal candle + HMA not fast down
-                    if close > row['Open']:
+                    if (near_poc or near_val) and close > row['Open']: # Bullish candle close
                         direction = 1
                         entry_price = close
-                        stop_price = curr_val - 2.0
+                        stop_price = min(low, curr_val) - 2.0 # Below wick or VAL
+                        target_price = curr_vah
+                        type_str = "Type A (Trend)"
+                        in_trade = True
+                        trades.append({'type': 'Long', 'entry_time': time, 'entry_price': entry_price, 'status': 'Open', 'desc': type_str})
+                        continue
+
+                # Short: Price < POC, HMA Down, Pullback to POC/VAH
+                elif close < curr_poc and hma_down:
+                    # Check Pullback near POC or VAH
+                    near_poc = abs(high - curr_poc) <= TP_BUFFER
+                    near_vah = abs(high - curr_vah) <= TP_BUFFER
+                    
+                    if (near_poc or near_vah) and close < row['Open']: # Bearish candle close
+                        direction = -1
+                        entry_price = close
+                        stop_price = max(high, curr_vah) + 2.0
+                        target_price = curr_val
+                        type_str = "Type A (Trend)"
+                        in_trade = True
+                        trades.append({'type': 'Short', 'entry_time': time, 'entry_price': entry_price, 'status': 'Open', 'desc': type_str})
+                        continue
+
+                # --- STRATEGY TYPE B: Value Rejection (Fade) ---
+                # Long Fade at VAL: Down trend hitting VAL, HMA turning up/flat
+                if not hma_up and low <= curr_val: # Hit VAL
+                     # Reversal sign: Bullish close + HMA slope improving (getting less negative or positive)
+                     if close > row['Open'] and curr_slope > prev_slope:
+                        direction = 1
+                        entry_price = close
+                        stop_price = curr_val - 3.0
                         target_price = curr_poc
                         type_str = "Type B (Fade)"
                         in_trade = True
                         trades.append({'type': 'Long', 'entry_time': time, 'entry_price': entry_price, 'status': 'Open', 'desc': type_str})
                         continue
                 
-                # Short Fade at VAH
-                if is_flat and high >= curr_vah:
-                    if close < row['Open']:
+                # Short Fade at VAH: Up trend hitting VAH, HMA turning down/flat
+                if not hma_down and high >= curr_vah:
+                    if close < row['Open'] and curr_slope < prev_slope:
                         direction = -1
                         entry_price = close
-                        stop_price = curr_vah + 2.0
+                        stop_price = curr_vah + 3.0
                         target_price = curr_poc
                         type_str = "Type B (Fade)"
                         in_trade = True
@@ -386,10 +323,11 @@ class DPOCBacktester:
                 
                 if exit_triggered:
                     trade['exit_time'] = time
+                    trade['pnl'] = pnl * 20 # ES Multiplier $50/pt, let's just log points or cash? NQ is $20. ES is $50. User said ES=F. 
+                    # Simpler to just keep points for now.
                     trade['pnl_pts'] = pnl
                     trade['status'] = 'Closed'
                     in_trade = False
-                    cooldown = COOLDOWN_BARS # Set cooldown
 
         return trades
 
