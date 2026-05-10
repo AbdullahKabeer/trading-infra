@@ -1,0 +1,278 @@
+"""
+Sniper Strategy Optimizer (Circuit Breaker Included)
+=============================================================
+Runs a Grid Search on the VWAP strategy WITH the Signal Reset lockouts.
+Uses Randomized Train/Test splits to prevent curve fitting.
+"""
+
+import os, glob, random
+import numpy as np
+from collections import defaultdict
+from combine_live import Session, TICK_SIZE, TICK_VALUE, COMMISSION_RT
+import itertools
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+COMBINE_STARTING_BAL = 50000
+COMBINE_PROFIT_TARGET = 3000
+COMBINE_EOD_TRAILING_DD = 2000  
+
+GUTTER_WIN = 1500
+GUTTER_LOSS = -1900  
+
+MAX_DAYS_PER_COMBINE = 60 
+SEARCH_MC_ITERATIONS = 300
+FINAL_MC_ITERATIONS = 1000
+
+TRAIN_TEST_SPLIT = 0.75  # 75% In-Sample, 25% Out-of-Sample
+
+# ============================================================
+# NEW SNIPER PARAMETER GRID
+# ============================================================
+# We test holding for more profit since the bot trades less often
+PARAM_GRID = {
+    "z_thresh": [1.5, 1.75],                # Standard or extreme entries
+    "stop_ratio": [0.3, 0.4, 0.5],          # Tight to medium leash
+    "exit_min_ticks": [8, 12, 16],          # 2, 3, or 4 points of profit
+    "trail_activate": [16, 20, 24]          # When to lock in the free roll
+}
+
+# ============================================================
+# PARAMETERIZED SIMULATOR WITH CIRCUIT BREAKER
+# ============================================================
+def simulate_parameterized_day(sess, params):
+    pos = None; trades = 0; daily_pnl = 0.0
+    lowest_intraday_pnl = 0.0  
+    
+    vpoc_hist = []
+    cum_pv = 0; cum_v = 0; cum_p2v = 0
+    vol_profile = defaultdict(float)
+    
+    z_thresh = params["z_thresh"]
+    stop_ratio = params["stop_ratio"]
+    exit_min = params["exit_min_ticks"]
+    trail_act = params["trail_activate"]
+    trail_dist = trail_act - 4
+    
+    # 1. INITIALIZE THE LOCKOUT
+    locked_side = None
+    
+    for i, b in enumerate(sess.bars):
+        h, l, c, v = b["h"], b["l"], b["c"], b["v"]
+        
+        tp = (h + l + c) / 3
+        cum_pv += tp * v; cum_v += v; cum_p2v += (tp ** 2) * v
+        vwap = cum_pv / cum_v if cum_v > 0 else 0
+        var = (cum_p2v / cum_v) - (vwap ** 2) if cum_v > 0 else 0
+        std = var ** 0.5 if var > 0 else 0
+        
+        lo_lv = round(l * 4) / 4; hi_lv = round(h * 4) / 4
+        n_levels = max(1, int((hi_lv - lo_lv) / 0.25) + 1); vpl = v / n_levels; lv = lo_lv
+        while lv <= hi_lv: vol_profile[lv] += vpl; lv += 0.25
+        vpoc = max(vol_profile, key=vol_profile.get) if vol_profile else 0
+        vpoc_hist.append(vpoc)
+        
+        stable = True
+        if len(vpoc_hist) >= 20:
+            recent = [p for p in vpoc_hist[-20:] if p > 0]
+            if len(recent) >= 2:
+                stable = (abs(recent[-1] - recent[0]) / len(recent)) <= 0.15
+                
+        if i < 45: continue
+        target = round(vwap / TICK_SIZE) * TICK_SIZE
+        z = (c - target) / std if std >= TICK_SIZE else 0
+        
+        temp_pnl = daily_pnl
+        if pos:
+            cur_ticks = (l - pos["ep"]) / TICK_SIZE if pos["dir"] == "LONG" else (pos["ep"] - h) / TICK_SIZE
+            temp_pnl += (cur_ticks * TICK_VALUE) - COMMISSION_RT
+        if temp_pnl < lowest_intraday_pnl: lowest_intraday_pnl = temp_pnl
+
+        if pos:
+            if pos["dir"] == "LONG":
+                gut_tp = pos["ep"] + ((GUTTER_WIN - daily_pnl) / TICK_VALUE) * TICK_SIZE
+                if h >= gut_tp: 
+                    daily_pnl += ((gut_tp - pos["ep"]) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT
+                    pos = None; break 
+                gut_sl = pos["ep"] - ((-GUTTER_LOSS - daily_pnl) / TICK_VALUE) * TICK_SIZE
+                if l <= gut_sl:
+                    daily_pnl += ((gut_sl - pos["ep"]) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT
+                    pos = None; break 
+                    
+                if l <= pos["sl"]: daily_pnl += ((pos["sl"] - pos["ep"]) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT; pos = None; continue
+                if h > pos["bp"]: pos["bp"] = h
+                
+                ur = (pos["bp"] - pos["ep"]) / TICK_SIZE; cur = (c - pos["ep"]) / TICK_SIZE
+                if c >= target and cur >= exit_min: daily_pnl += ((c - pos["ep"]) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT; pos = None; continue
+                if ur >= trail_act: 
+                    tl = round((pos["bp"] - trail_dist * TICK_SIZE) / TICK_SIZE) * TICK_SIZE
+                    if tl > pos["sl"]: pos["sl"] = tl
+                if ur >= 10 and pos["sl"] < pos["ep"]: pos["sl"] = pos["ep"]
+                if (i - pos["bar_idx"]) > 90 and cur > -4: daily_pnl += ((c - pos["ep"]) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT; pos = None; continue
+                
+            else: 
+                gut_tp = pos["ep"] - ((GUTTER_WIN - daily_pnl) / TICK_VALUE) * TICK_SIZE
+                if l <= gut_tp: 
+                    daily_pnl += ((pos["ep"] - gut_tp) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT
+                    pos = None; break
+                gut_sl = pos["ep"] + ((-GUTTER_LOSS - daily_pnl) / TICK_VALUE) * TICK_SIZE
+                if h >= gut_sl:
+                    daily_pnl += ((pos["ep"] - gut_sl) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT
+                    pos = None; break
+                    
+                if h >= pos["sl"]: daily_pnl += ((pos["ep"] - pos["sl"]) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT; pos = None; continue
+                if l < pos["bp"]: pos["bp"] = l
+                
+                ur = (pos["ep"] - pos["bp"]) / TICK_SIZE; cur = (pos["ep"] - c) / TICK_SIZE
+                if c <= target and cur >= exit_min: daily_pnl += ((pos["ep"] - c) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT; pos = None; continue
+                if ur >= trail_act: 
+                    tl = round((pos["bp"] + trail_dist * TICK_SIZE) / TICK_SIZE) * TICK_SIZE
+                    if tl < pos["sl"]: pos["sl"] = tl
+                if ur >= 10 and pos["sl"] > pos["ep"]: pos["sl"] = pos["ep"]
+                if (i - pos["bar_idx"]) > 90 and cur > -4: daily_pnl += ((pos["ep"] - c) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT; pos = None; continue
+
+        elif i <= 360 and trades < 50 and daily_pnl < GUTTER_WIN and daily_pnl > GUTTER_LOSS:
+            
+            # 2. SIGNAL RESET CHECK
+            if locked_side == "LONG" and z > -0.5: locked_side = None
+            if locked_side == "SHORT" and z < 0.5: locked_side = None
+            
+            if stable and abs(z) >= z_thresh:
+                dist = abs(c - target)
+                sd = max(min(dist * stop_ratio, 24 * TICK_SIZE), 6 * TICK_SIZE)
+                
+                # 3. ENFORCE LOCKOUT ON ENTRY
+                if z <= -z_thresh and locked_side != "LONG":
+                    pos = {"dir": "LONG", "ep": c, "sl": round((c - sd) / TICK_SIZE) * TICK_SIZE, "bp": c, "bar_idx": i}
+                    trades += 1
+                    locked_side = "LONG" # Lock it out
+                elif z >= z_thresh and locked_side != "SHORT":
+                    pos = {"dir": "SHORT", "ep": c, "sl": round((c + sd) / TICK_SIZE) * TICK_SIZE, "bp": c, "bar_idx": i}
+                    trades += 1
+                    locked_side = "SHORT" # Lock it out
+
+    if pos:
+        c = sess.bars[-1]["c"]
+        pnl = ((c - pos["ep"]) / TICK_SIZE if pos["dir"] == "LONG" else (pos["ep"] - c) / TICK_SIZE) * TICK_VALUE - COMMISSION_RT
+        daily_pnl += pnl
+        if daily_pnl < lowest_intraday_pnl: lowest_intraday_pnl = daily_pnl
+
+    return daily_pnl, lowest_intraday_pnl, trades
+
+# ============================================================
+# MONTE CARLO ENGINE (CORRECT TOPSTEP TDD LOGIC)
+# ============================================================
+def run_monte_carlo(daily_results, iterations):
+    passed = 0; failed = 0
+    days_to_pass = []; fail_reasons = defaultdict(int)
+    
+    valid_days = [d for d in daily_results if d[2] > 0] 
+    if not valid_days: return 0.0, 0.0, {"NO_TRADES_TAKEN": iterations}
+    
+    for _ in range(iterations):
+        acct_bal = COMBINE_STARTING_BAL
+        highest_eod_bal = COMBINE_STARTING_BAL
+        days_traded = 0
+        status = "TRADING"
+        
+        while status == "TRADING":
+            days_traded += 1
+            if days_traded > MAX_DAYS_PER_COMBINE:
+                status = "FAILED_TIME"; break
+                
+            day_pnl, lowest_intraday, _ = random.choice(valid_days)
+            
+            raw_tdd_limit = highest_eod_bal - COMBINE_EOD_TRAILING_DD
+            tdd_limit = min(raw_tdd_limit, COMBINE_STARTING_BAL)
+            
+            if (acct_bal + lowest_intraday) <= tdd_limit:
+                status = "FAILED_MAX_LOSS"; break
+                
+            acct_bal += day_pnl
+            if acct_bal > highest_eod_bal:
+                highest_eod_bal = acct_bal
+                
+            if acct_bal >= (COMBINE_STARTING_BAL + COMBINE_PROFIT_TARGET):
+                status = "PASSED"; break
+                
+        if status == "PASSED":
+            passed += 1
+            days_to_pass.append(days_traded)
+        else:
+            failed += 1
+            fail_reasons[status] += 1
+
+    pass_rate = (passed / iterations) * 100
+    avg_days = np.mean(days_to_pass) if days_to_pass else 0
+    return pass_rate, avg_days, fail_reasons
+
+# ============================================================
+# EXECUTION
+# ============================================================
+if __name__ == "__main__":
+    files = glob.glob(os.path.join("es_sessions", "*.json"))
+    sessions = [Session.load(os.path.basename(f).replace(".json", "")) for f in files]
+    sessions = [s for s in sessions if s is not None and len(s.bars) > 100]
+    
+    if len(sessions) < 10:
+        print("Not enough data to run optimization.")
+        exit()
+        
+    print(f"Shuffling {len(sessions)} sessions to randomize market conditions...")
+    random.shuffle(sessions) 
+    
+    split_idx = int(len(sessions) * TRAIN_TEST_SPLIT)
+    train_sessions = sessions[:split_idx]
+    test_sessions = sessions[split_idx:]
+    
+    print(f"Data Loaded: {len(sessions)} total sessions.")
+    print(f"  Training Set (Randomized): {len(train_sessions)} days")
+    print(f"  Testing Set  (Randomized): {len(test_sessions)} days")
+    print("-" * 65)
+        
+    keys, values = zip(*PARAM_GRID.items())
+    permutations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    print(f"PHASE 1: Training {len(permutations)} Sniper parameter combinations...")
+    print(f"Simulating {SEARCH_MC_ITERATIONS} Combine attempts per combo...")
+    
+    results = []
+    
+    for idx, params in enumerate(permutations):
+        train_daily_results = [simulate_parameterized_day(s, params) for s in train_sessions]
+        pass_rate, avg_days, _ = run_monte_carlo(train_daily_results, SEARCH_MC_ITERATIONS)
+        results.append({"params": params, "pass_rate": pass_rate, "avg_days": avg_days, "daily": train_daily_results})
+        
+        if (idx + 1) % 10 == 0:
+            print(f" Processed {idx + 1}/{len(permutations)}...")
+
+    results.sort(key=lambda x: x["pass_rate"], reverse=True)
+    best_result = results[0]
+    best_params = best_result["params"]
+    
+    print("\n" + "=" * 65)
+    print(" PHASE 2: OUT-OF-SAMPLE BLIND TEST (Sniper Architecture)")
+    print("=" * 65)
+    
+    print("WINNING PARAMETERS FROM RANDOMIZED TRAINING:")
+    for k, v in best_params.items():
+        print(f"  {k}: {v}")
+    print(f"  (In-Sample Est. Pass Rate: {best_result['pass_rate']:.1f}%)")
+    
+    print(f"\nTesting on unseen randomized days ({FINAL_MC_ITERATIONS} attempts)...")
+    
+    test_daily_results = [simulate_parameterized_day(s, best_params) for s in test_sessions]
+    final_pass_rate, final_avg_days, fail_reasons = run_monte_carlo(test_daily_results, FINAL_MC_ITERATIONS)
+    
+    print(f"\nFINAL OUT-OF-SAMPLE PERFORMANCE:")
+    print(f"  True Pass Rate:    {final_pass_rate:.1f}%")
+    print(f"  Avg Days to Pass:  {final_avg_days:.1f}")
+    
+    dropoff = best_result['pass_rate'] - final_pass_rate
+    if dropoff > 15:
+        print(f"\n⚠ WARNING: Significant degradation detected ({dropoff:.1f}% drop).")
+    elif dropoff < -5:
+         print(f"\n📈 NOTE: The Out-of-Sample pass rate is higher than the training rate!")
+    else:
+        print(f"\n✓ SYSTEM ROBUST: The In-Sample and Out-of-Sample metrics align perfectly.")
