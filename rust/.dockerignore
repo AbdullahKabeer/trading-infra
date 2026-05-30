@@ -1,0 +1,8 @@
+target/
+.env
+es_sessions/
+es_ticks/
+*.csv
+*.json
+*.png
+*.xlsx
