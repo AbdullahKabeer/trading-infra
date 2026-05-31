@@ -1,5 +1,6 @@
 mod api;
 mod backtest_runner;
+mod backtest_server;
 mod config;
 mod feed;
 mod market;
@@ -23,11 +24,14 @@ use crate::types::{AppState, BacktestStats, BarEvent, FillEvent, RegimeState, Ti
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // ── Backtest subcommand — no auth needed ───────────────────────────────────
+    // ── Backtest subcommands — no auth needed ─────────────────────────────────
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(|s| s.as_str()) == Some("backtest") {
         backtest_runner::run_from_cli(&raw_args[2..]);
         return Ok(());
+    }
+    if raw_args.get(1).map(|s| s.as_str()) == Some("backtest-server") {
+        return backtest_server::run_server(&raw_args[2..]).await;
     }
 
     // ── Environment & Logging ──────────────────────────────────────────────────

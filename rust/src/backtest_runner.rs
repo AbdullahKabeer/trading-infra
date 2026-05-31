@@ -34,6 +34,10 @@ pub struct BtConfig {
     pub account_balance: f64,
     pub trailing_mll: f64,
     pub verbose: bool,
+    // Prop firm risk controls
+    pub daily_profit_cap: f64,  // stop new entries when daily P&L >= this
+    pub daily_loss_limit: f64,  // stop new entries when daily P&L <= -this
+    pub profit_target: f64,     // combine pass target (for consistency check)
 }
 
 impl Default for BtConfig {
@@ -61,6 +65,9 @@ impl Default for BtConfig {
             account_balance: ACCOUNT_START_BALANCE,
             trailing_mll: TRAILING_MLL_DISTANCE,
             verbose: false,
+            daily_profit_cap: f64::MAX,
+            daily_loss_limit: f64::MAX,
+            profit_target: 3000.0,
         }
     }
 }
@@ -93,6 +100,15 @@ impl BtConfig {
                 "--balance" => { if let Ok(v) = next().parse() { cfg.account_balance = v; } i += 1; }
                 "--min-stop" => { if let Ok(v) = next().parse() { cfg.min_stop_ticks = v; } i += 1; }
                 "--max-stop" => { if let Ok(v) = next().parse() { cfg.max_stop_ticks = v; } i += 1; }
+                "--daily-cap" => { if let Ok(v) = next().parse() { cfg.daily_profit_cap = v; } i += 1; }
+                "--daily-loss" => { if let Ok(v) = next().parse() { cfg.daily_loss_limit = v; } i += 1; }
+                "--profit-target" => { if let Ok(v) = next().parse() { cfg.profit_target = v; } i += 1; }
+                "--prop-firm" => {
+                    // TopStep $50K defaults: cap below consistency threshold, protect MLL
+                    cfg.daily_profit_cap = 1499.0;
+                    cfg.daily_loss_limit = 700.0;
+                    cfg.profit_target = 3000.0;
+                }
                 s if !s.starts_with('-') => dir = s.to_string(),
                 _ => {}
             }
@@ -174,15 +190,17 @@ fn load_sessions(dir: &str) -> anyhow::Result<Vec<DaySession>> {
 
 // ── Backtest engine ────────────────────────────────────────────────────────────
 
-#[derive(Default)]
-struct DayResult {
-    date: String,
-    trades: u32,
-    wins: u32,
-    losses: u32,
-    daily_pnl: f64,
-    cumul_pnl: f64,
-    flag: &'static str, // "" | "FOMC" | "CPI" | "NFP"
+#[derive(Default, Clone)]
+pub struct DayResult {
+    pub date: String,
+    pub trades: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub daily_pnl: f64,
+    pub cumul_pnl: f64,
+    pub flag: &'static str,
+    pub capped: bool,       // hit daily profit cap
+    pub loss_limited: bool, // hit daily loss limit
 }
 
 struct TradeLog {
@@ -228,6 +246,8 @@ fn run_backtest_cfg(
         let mut trades_today = 0u32;
         let mut wins_today = 0u32;
         let mut losses_today = 0u32;
+        let mut day_capped = false;
+        let mut day_loss_limited = false;
 
         // Position state
         let mut pos_dir: Option<&'static str> = None;
@@ -355,6 +375,9 @@ fn run_backtest_cfg(
                 if cfg.lunch_skip && tod >= LUNCH_SKIP_START && tod < LUNCH_SKIP_END { continue; }
                 if trades_today >= cfg.max_trades { continue; }
                 if bar_idx - last_exit_bar < 2 { continue; }
+                // Prop firm risk guards
+                if daily_pnl >= cfg.daily_profit_cap { day_capped = true; continue; }
+                if daily_pnl <= -cfg.daily_loss_limit { day_loss_limited = true; continue; }
 
                 let std = bar.vwap_std;
                 if std < 0.01 { continue; }
@@ -423,6 +446,8 @@ fn run_backtest_cfg(
             daily_pnl,
             cumul_pnl: total_pnl,
             flag,
+            capped: day_capped,
+            loss_limited: day_loss_limited,
         });
     }
 
@@ -594,6 +619,40 @@ fn print_report(
         "Active Days", &format!("{}", days_with_trades));
     println!("{sep}");
 
+    // Prop firm section (always shown, highlights violations)
+    let best_day = day_results.iter().map(|d| d.daily_pnl).fold(f64::NEG_INFINITY, f64::max);
+    let consistency_threshold = cfg.profit_target * 0.5;
+    let consistency_violations: usize = day_results.iter().filter(|d| d.daily_pnl >= consistency_threshold).count();
+    let loss_limit_days: usize = day_results.iter().filter(|d| d.loss_limited).count();
+    let capped_days: usize = day_results.iter().filter(|d| d.capped).count();
+    let daily_exp = if days_with_trades > 0 { total_pnl / days_with_trades as f64 } else { 0.0 };
+    let est_days = if daily_exp > 0.0 { (cfg.profit_target / daily_exp).ceil() as i64 } else { -1 };
+    let mll_breach_days: usize = {
+        let mut peak = 0.0f64;
+        day_results.iter().filter(|d| {
+            if d.cumul_pnl > peak { peak = d.cumul_pnl; }
+            peak - d.cumul_pnl > cfg.trailing_mll
+        }).count()
+    };
+    println!();
+    println!("  PROP FIRM  ·  TopStep $50K  ·  Pass Target ${:.0}  ·  MLL $2,000 trailing", cfg.profit_target);
+    println!("  {}", thin);
+    let con_status = if consistency_violations == 0 { "PASS" } else { "FAIL" };
+    let mll_status = if mll_breach_days == 0 { "PASS" } else { "RISK" };
+    let est_str = if est_days > 0 { format!("~{est_days} days") } else { "N/A (losing)".to_string() };
+    row("Best Day", &format!("{:+.2}", best_day),
+        "Consistency", &format!("{con_status} ({consistency_violations} violations >=${:.0})", consistency_threshold),
+        "", "");
+    row("Est. Days to Pass", &est_str,
+        "MLL Risk", &format!("{mll_status} ({mll_breach_days} breaches)"),
+        "", "");
+    if cfg.daily_loss_limit < f64::MAX {
+        row("Daily Loss Limit", &format!("${:.0} ({loss_limit_days} days stopped)", cfg.daily_loss_limit),
+            "Daily Cap", &format!("${:.0} ({capped_days} days capped)", cfg.daily_profit_cap),
+            "", "");
+    }
+    println!("  {}", thin);
+
     // Equity curve
     println!();
     println!("  Equity Curve");
@@ -609,10 +668,14 @@ fn print_report(
     println!("  {:<12} {:>6} {:>4} {:>4}  {:>10}  {:>10}  {}", "DATE", "TRADES", "W", "L", "DAY P&L", "CUMUL P&L", "");
     println!("  {}", thin);
     for d in day_results {
-        let flag_str = if d.flag.is_empty() { "".to_string() } else { format!("  [{}]", d.flag) };
+        let mut tags = String::new();
+        if !d.flag.is_empty() { tags.push_str(&format!("  [{}]", d.flag)); }
+        if d.capped { tags.push_str("  [CAP]"); }
+        if d.loss_limited { tags.push_str("  [LTD]"); }
+        if d.daily_pnl >= consistency_threshold { tags.push_str("  [!CON]"); }
         println!("  {:<12} {:>6} {:>4} {:>4}  {:>+10.2}  {:>+10.2}{}",
             d.date, d.trades, d.wins, d.losses,
-            d.daily_pnl, d.cumul_pnl, flag_str);
+            d.daily_pnl, d.cumul_pnl, tags);
     }
     println!("  {}", thin);
     println!("  {:<12} {:>6} {:>4} {:>4}  {:>+10.2}",
@@ -637,6 +700,55 @@ fn print_report(
     println!("    cargo run -- backtest ../nq_sessions --nq --z 1.3 --trail-on 10 --verbose");
     println!("    cargo run -- backtest ../es_sessions --target vpoc --no-lunch");
     println!();
+}
+
+// ── Public API for backtest_server ────────────────────────────────────────────
+
+pub struct BacktestResult {
+    pub total_pnl: f64,
+    pub max_dd: f64,
+    pub total_trades: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub max_consec_loss: f64,
+    pub days: Vec<DayResult>,
+    pub trade_log: Vec<PublicTradeLog>,
+}
+
+pub struct PublicTradeLog {
+    pub date: String,
+    pub dir: String,
+    pub entry: f64,
+    pub exit: f64,
+    pub ticks: f64,
+    pub pnl: f64,
+    pub reason: String,
+}
+
+pub fn load_sessions_pub(dir: &str) -> anyhow::Result<Vec<PublicSession>> {
+    let sessions = load_sessions(dir)?;
+    Ok(sessions.into_iter().map(|s| PublicSession { date: s.date, bars: s.bars }).collect())
+}
+
+pub struct PublicSession {
+    pub date: String,
+    pub bars: Vec<Bar>,
+}
+
+pub fn run_backtest_pub(sessions: &[PublicSession], cfg: &BtConfig) -> BacktestResult {
+    let internal: Vec<DaySession> = sessions.iter().map(|s| DaySession {
+        date: s.date.clone(),
+        bars: s.bars.clone(),
+    }).collect();
+    let (total_pnl, max_dd, total_trades, wins, losses, max_consec_loss, days, tl) =
+        run_backtest_cfg(&internal, cfg);
+    BacktestResult {
+        total_pnl, max_dd, total_trades, wins, losses, max_consec_loss, days,
+        trade_log: tl.into_iter().map(|t| PublicTradeLog {
+            date: t.date, dir: t.dir, entry: t.entry, exit: t.exit,
+            ticks: t.ticks, pnl: t.pnl, reason: t.reason,
+        }).collect(),
+    }
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
