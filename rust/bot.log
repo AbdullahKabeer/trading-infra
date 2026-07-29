@@ -1,0 +1,27 @@
+[2m2026-06-17T15:29:34.301094Z[0m [32m INFO[0m [2mes_bot::api::auth[0m[2m:[0m Authenticated successfully
+[2m2026-06-17T15:29:35.134141Z[0m [32m INFO[0m [2mes_bot::market::regime[0m[2m:[0m High-impact event today: FOMC — behavior: reduce
+[2m2026-06-17T15:29:35.142397Z[0m [32m INFO[0m [2mes_bot::market::regime[0m[2m:[0m Prev session 2026-06-16: VWAP=7609.93 VPOC=7609.50 Close=7588.00
+[2m2026-06-17T15:29:35.358807Z[0m [32m INFO[0m [2mes_bot[0m[2m:[0m Loaded 13470 historical bars from prior sessions
+[2m2026-06-17T15:29:35.402558Z[0m [32m INFO[0m [2mes_bot::web::server[0m[2m:[0m Dashboard: http://localhost:8080
+[2m2026-06-17T15:29:35.838550Z[0m [32m INFO[0m [2mes_bot::feed::user_hub[0m[2m:[0m UserHub connected
+[2m2026-06-17T15:29:35.838550Z[0m [32m INFO[0m [2mes_bot::feed::websocket[0m[2m:[0m WebSocket connected, running backfill...
+[2m2026-06-17T15:29:35.838653Z[0m [32m INFO[0m [2mes_bot::feed::user_hub[0m[2m:[0m UserHub subscribed (account=20653324)
+[2m2026-06-17T15:29:35.838967Z[0m [32m INFO[0m [2mes_bot::feed::websocket[0m[2m:[0m ✓ Live stream active (CON.F.US.EP.U26) + DOM
+[2m2026-06-17T15:30:00.014613Z[0m [32m INFO[0m [2mes_bot::strategy::bot[0m[2m:[0m VWAP RECLAIM Short | SL=7583.00 TP=7573.75 atr=3.33
+[2m2026-06-17T15:30:00.059654Z[0m [32m INFO[0m [2mes_bot::api::orders[0m[2m:[0m ENTRY LIMIT -> SELL 1 @ 7582.25
+[2m2026-06-17T15:30:00.173025Z[0m [32m INFO[0m [2mes_bot::feed::user_hub[0m[2m:[0m UserHub: entry fill BUY 0x0.00 fees=0.00
+[2m2026-06-17T15:30:00.193978Z[0m [32m INFO[0m [2mes_bot::api::orders[0m[2m:[0m Entry limit placed: order_id=3145600250
+[2m2026-06-17T15:30:00.781269Z[0m [32m INFO[0m [2mes_bot::strategy::order_manager[0m[2m:[0m Entry filled @ Some(7582.25)
+[2m2026-06-17T15:30:00.781360Z[0m [32m INFO[0m [2mes_bot::strategy::order_manager[0m[2m:[0m ENTERED Short @ 7582.25 (uuid=123d27b1-e874-4a26-9d09-7360d041708e)
+[2m2026-06-17T15:30:00.781402Z[0m [32m INFO[0m [2mes_bot::api::orders[0m[2m:[0m BRACKET SL -> BUY 1 Stop @ 7583.00
+[2m2026-06-17T15:30:00.880736Z[0m [32m INFO[0m [2mes_bot::api::orders[0m[2m:[0m SL bracket placed: 3145600352
+[2m2026-06-17T15:30:00.880816Z[0m [32m INFO[0m [2mes_bot::strategy::order_manager[0m[2m:[0m SL placed @ 7583.00 (id=3145600352)
+[2m2026-06-17T15:30:00.880841Z[0m [32m INFO[0m [2mes_bot::api::orders[0m[2m:[0m BRACKET TP -> BUY 1 Limit @ 7573.75
+[2m2026-06-17T15:30:01.013617Z[0m [32m INFO[0m [2mes_bot::api::orders[0m[2m:[0m TP bracket placed: 3145600361
+[2m2026-06-17T15:30:01.013723Z[0m [32m INFO[0m [2mes_bot::strategy::order_manager[0m[2m:[0m TP placed @ 7573.75 (id=3145600361)
+[2m2026-06-17T15:30:01.013939Z[0m [32m INFO[0m [2mes_bot::strategy::bot[0m[2m:[0m ENTERED Short @ 7582.25 SL=7583.00 TP=7573.75
+[2m2026-06-17T15:30:10.251219Z[0m [32m INFO[0m [2mes_bot::feed::user_hub[0m[2m:[0m UserHub: entry fill BUY 0x0.00 fees=0.00
+[2m2026-06-17T15:30:10.251639Z[0m [32m INFO[0m [2mes_bot::feed::user_hub[0m[2m:[0m UserHub: entry fill BUY 0x0.00 fees=0.00
+[2m2026-06-17T15:30:10.719249Z[0m [32m INFO[0m [2mes_bot::strategy::order_manager[0m[2m:[0m sync_from_server: server flat but bot has position → ExternalClose
+[2m2026-06-17T15:30:11.061808Z[0m [32m INFO[0m [2mes_bot::strategy::bot[0m[2m:[0m CLOSED SHORT @ 7582.88 (SERVER FILL) | Net: $-34.05 | Total: $-33.15
+[2m2026-06-17T15:30:40.533149Z[0m [32m INFO[0m [2mes_bot::strategy::bot[0m[2m:[0m P&L rebase: $-33.15 → $-41.30 (broker authoritative)
