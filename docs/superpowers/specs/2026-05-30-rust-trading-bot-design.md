@@ -1,4 +1,4 @@
-# Rust Trading Bot — Design Spec
+ok # Rust Trading Bot — Design Spec
 **Date:** 2026-05-30
 **Scope:** Rewrite `combine_live.py` in Rust (`rust/` subdirectory). Same strategy, same API, correct concurrency, TUI + web dashboard.
 

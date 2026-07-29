@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::api::auth::TokenHandle;
 use crate::api::orders::OrderClient;
 use crate::api::positions::{close_action_from_side, search_open};
-use crate::config::{CONTRACTS, DRY_RUN, SYNC_INTERVAL_SECS, TICK_SIZE};
+use crate::config::{CONTRACTS, SYNC_INTERVAL_SECS};
 use crate::types::{AppState, Direction, FillEvent, ServerPositionState, TradeCommand};
 
 pub async fn run(
@@ -26,6 +26,8 @@ pub async fn run(
     let mut orphan_confirm: u32 = 0;
     // Track the current known position uuid (set on Entered, cleared on Closed)
     let mut active_pos_uuid: Option<Uuid> = None;
+    // Throttle broker P&L rebase to once per 60s, only when flat
+    let mut last_rebase = std::time::Instant::now() - std::time::Duration::from_secs(60);
 
     loop {
         tokio::select! {
@@ -41,6 +43,7 @@ pub async fn run(
                 sync_from_server(
                     &client, &token, account_id, &contract_id,
                     &fill_tx, &state, &mut active_pos_uuid, &mut orphan_confirm,
+                    &mut last_rebase,
                 ).await;
             }
         }
@@ -71,6 +74,7 @@ async fn handle_command(
     active_pos_uuid: &mut Option<Uuid>,
     orphan_confirm: &mut u32,
 ) {
+    let is_dry = state.read().await.dry_run;
     let bearer = token.read().await.bearer();
     let oc = OrderClient {
         client,
@@ -84,7 +88,16 @@ async fn handle_command(
             dir, sl_price, tp_price, entry_price, entry_vwap,
             tp_buffer_ticks, bar_idx, atr: _,
         } => {
-            // Verify server is flat before entering
+            // Local guard: active_pos_uuid is set immediately when we place an order,
+            // long before the API propagates the fill — prevents duplicate entries
+            // from rapid bar events while the first fill is still in-flight.
+            if active_pos_uuid.is_some() {
+                tracing::warn!("Enter: duplicate blocked — already tracking position {:?}", active_pos_uuid);
+                let _ = fill_tx.send(FillEvent::Error("duplicate entry blocked".into())).await;
+                return;
+            }
+
+            // Secondary check: verify server is flat before entering
             match search_open(client, &bearer, account_id, contract_id).await {
                 Err(e) => {
                     tracing::warn!("Enter: position check failed ({e}) — aborting entry");
@@ -112,10 +125,13 @@ async fn handle_command(
 
             let pos_uuid = Uuid::new_v4();
 
-            if DRY_RUN {
+            // Reserve the UUID immediately — any subsequent Enter command will be
+            // blocked by the active_pos_uuid guard above, even before the fill lands.
+            *active_pos_uuid = Some(pos_uuid);
+            *orphan_confirm = 0;
+
+            if is_dry {
                 tracing::info!("[DRY RUN] Enter {dir:?} @ ~{entry_price:.2} SL={sl_price:.2} TP={tp_price:.2}");
-                *active_pos_uuid = Some(pos_uuid);
-                *orphan_confirm = 0;
                 let _ = fill_tx.send(FillEvent::Entered {
                     pos_uuid,
                     fill_price: entry_price,
@@ -129,36 +145,101 @@ async fn handle_command(
                 return;
             }
 
-            match oc.place_market(action, CONTRACTS, Some(sl_price), Some(tp_price), entry_price).await {
+            // Place limit entry at signal price — fills at exact price, zero slippage.
+            let entry_order_id = match oc.place_entry_limit(action, CONTRACTS, entry_price).await {
                 Err(e) => {
-                    tracing::error!("place_market failed: {e}");
-                    let _ = fill_tx.send(FillEvent::Error(format!("place_market: {e}"))).await;
+                    tracing::error!("place_entry_limit failed: {e}");
+                    *active_pos_uuid = None;
+                    let _ = fill_tx.send(FillEvent::Error(format!("place_entry_limit: {e}"))).await;
                     return;
                 }
-                Ok(resp) => {
-                    if !resp["success"].as_bool().unwrap_or(false) {
-                        tracing::warn!("place_market returned failure: {resp}");
-                        let _ = fill_tx.send(FillEvent::Error(format!("place failed: {resp}"))).await;
-                        return;
-                    }
+                Ok(resp) if !resp["success"].as_bool().unwrap_or(false) => {
+                    tracing::warn!("Entry limit rejected: {resp}");
+                    *active_pos_uuid = None;
+                    let _ = fill_tx.send(FillEvent::Error(format!("entry rejected: {resp}"))).await;
+                    return;
                 }
-            }
-
-            // Wait for fill
-            sleep(Duration::from_secs(1)).await;
-
-            // Re-check position to get actual fill price
-            let fill_price = match search_open(client, &bearer, account_id, contract_id).await {
-                Ok(ServerPositionState::Open { avg_price, .. }) => {
-                    avg_price.unwrap_or(entry_price)
-                }
-                _ => entry_price,
+                Ok(resp) => resp["orderId"].as_i64().unwrap_or(0),
             };
 
-            *active_pos_uuid = Some(pos_uuid);
-            *orphan_confirm = 0;
+            // Poll active_orders every 500 ms until fill confirmed (max 60 s).
+            // On each tick we check whether the entry order_id has left the open-orders
+            // list (status Filled/Cancelled/Expired/Rejected) and then read the actual
+            // fill price from the open position.
+            let fill_price = 'poll: {
+                for attempt in 0usize..120 {
+                    sleep(Duration::from_millis(500)).await;
+
+                    let orders = match oc.active_orders().await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!("active_orders poll failed (attempt {attempt}): {e}");
+                            continue;
+                        }
+                    };
+
+                    match orders.iter().find(|o| o["id"].as_i64().unwrap_or(0) == entry_order_id) {
+                        // Order gone from open list — check whether position opened
+                        None => {
+                            match search_open(client, &bearer, account_id, contract_id).await {
+                                Ok(ServerPositionState::Open { avg_price, .. }) => {
+                                    tracing::info!("Entry filled @ {avg_price:?}");
+                                    break 'poll avg_price.unwrap_or(entry_price);
+                                }
+                                _ => {
+                                    // Small race: order disappeared but position not visible yet.
+                                    // Give the server one more tick.
+                                    if attempt + 1 < 120 { continue; }
+                                    break 'poll entry_price; // best-effort fallback
+                                }
+                            }
+                        }
+                        // Order explicitly filled
+                        Some(o) if o["status"].as_i64() == Some(2) => {
+                            let fp = o["filledPrice"].as_f64().unwrap_or(entry_price);
+                            tracing::info!("Entry filled (status=2) @ {fp:.2}");
+                            break 'poll fp;
+                        }
+                        // Cancelled / expired / rejected — give up on this signal
+                        Some(o) if matches!(o["status"].as_i64(), Some(3) | Some(4) | Some(5)) => {
+                            let st = o["status"].as_i64().unwrap_or(-1);
+                            tracing::warn!("Entry limit not filled: order_status={st}");
+                            *active_pos_uuid = None;
+                            *orphan_confirm = 0;
+                            let _ = fill_tx.send(FillEvent::Error(format!("entry order status={st}"))).await;
+                            return;
+                        }
+                        // Still open (status 0/1/6) — keep polling
+                        _ => continue,
+                    }
+                }
+
+                // 60-second timeout — cancel the stale entry order and abort
+                tracing::warn!("Entry limit timed out — cancelling order {entry_order_id}");
+                let _ = oc.cancel(entry_order_id).await;
+                *active_pos_uuid = None;
+                *orphan_confirm = 0;
+                let _ = fill_tx.send(FillEvent::Error("entry limit timed out".into())).await;
+                return;
+            };
 
             tracing::info!("ENTERED {dir:?} @ {fill_price:.2} (uuid={pos_uuid})");
+
+            // Place SL and TP as explicit orders — no Auto OCO dependency.
+            let close_action = if dir == Direction::Long { "SELL" } else { "BUY" };
+            match oc.place_stop(close_action, CONTRACTS, sl_price).await {
+                Ok(resp) if resp["success"].as_bool().unwrap_or(false) =>
+                    tracing::info!("SL placed @ {sl_price:.2} (id={})", resp["orderId"]),
+                Ok(resp) => tracing::warn!("SL order failed: {resp}"),
+                Err(e)   => tracing::warn!("SL order error: {e}"),
+            }
+            match oc.place_limit(close_action, CONTRACTS, tp_price).await {
+                Ok(resp) if resp["success"].as_bool().unwrap_or(false) =>
+                    tracing::info!("TP placed @ {tp_price:.2} (id={})", resp["orderId"]),
+                Ok(resp) => tracing::warn!("TP order failed: {resp}"),
+                Err(e)   => tracing::warn!("TP order error: {e}"),
+            }
+
             let _ = fill_tx.send(FillEvent::Entered {
                 pos_uuid,
                 fill_price,
@@ -170,7 +251,6 @@ async fn handle_command(
                 tp_buffer_ticks,
             }).await;
 
-            // Publish active orders
             publish_active_orders(&oc, fill_tx, state).await;
         }
 
@@ -227,7 +307,7 @@ async fn handle_command(
 
                     let close_size = size.max(1);
 
-                    if DRY_RUN {
+                    if is_dry {
                         tracing::info!("[DRY RUN] Exit @ {ref_price:.2} reason={reason}");
                         *active_pos_uuid = None;
                         *orphan_confirm = 0;
@@ -291,13 +371,13 @@ async fn handle_command(
                     Ok(false) => {
                         tracing::debug!("update_stop: no matching order found");
                         // Still notify bot so it can update local state
-                        if DRY_RUN {
+                        if is_dry {
                             let _ = fill_tx.send(FillEvent::StopModified { pos_uuid, new_stop }).await;
                         }
                     }
                     Err(e) => tracing::warn!("update_stop failed: {e}"),
                 }
-            } else if DRY_RUN {
+            } else if is_dry {
                 let _ = fill_tx.send(FillEvent::StopModified { pos_uuid, new_stop }).await;
             }
         }
@@ -316,13 +396,13 @@ async fn handle_command(
                     }
                     Ok(false) => {
                         tracing::debug!("update_tp: no matching order found");
-                        if DRY_RUN {
+                        if is_dry {
                             let _ = fill_tx.send(FillEvent::TpModified { pos_uuid, new_tp }).await;
                         }
                     }
                     Err(e) => tracing::warn!("update_tp failed: {e}"),
                 }
-            } else if DRY_RUN {
+            } else if is_dry {
                 let _ = fill_tx.send(FillEvent::TpModified { pos_uuid, new_tp }).await;
             }
         }
@@ -341,7 +421,7 @@ async fn handle_command(
                 })
             };
 
-            if DRY_RUN {
+            if is_dry {
                 let _ = fill_tx.send(FillEvent::ScaledOut {
                     pos_uuid,
                     fill_price: price,
@@ -412,7 +492,9 @@ async fn sync_from_server(
     state: &Arc<RwLock<AppState>>,
     active_pos_uuid: &mut Option<Uuid>,
     orphan_confirm: &mut u32,
+    last_rebase: &mut std::time::Instant,
 ) {
+    let is_dry = state.read().await.dry_run;
     let bearer = token.read().await.bearer();
     let oc = OrderClient {
         client,
@@ -435,14 +517,43 @@ async fn sync_from_server(
             tracing::debug!("sync_from_server: unknown state — skipping");
         }
         Ok(ServerPositionState::Flat) => {
+            // Rebase daily P&L from broker once per 60s while flat
+            if !bot_has_pos && last_rebase.elapsed() >= std::time::Duration::from_secs(60) {
+                *last_rebase = std::time::Instant::now();
+                let today_start = chrono::Utc::now().format("%Y-%m-%dT00:00:00.000Z").to_string();
+                match crate::api::trades::search(client, &bearer, account_id, &today_start, None).await {
+                    Ok(trades) => {
+                        let pnl: f64 = trades.iter()
+                            .filter_map(|t| {
+                                let gross = t["profitAndLoss"].as_f64()?;
+                                let fees  = t["fees"].as_f64().unwrap_or(0.0);
+                                let comm  = t["commissions"].as_f64().unwrap_or(0.0);
+                                Some(gross - fees - comm)
+                            })
+                            .sum();
+                        let completed = trades.iter()
+                            .filter(|t| !t["profitAndLoss"].is_null())
+                            .count() as u32;
+                        let _ = fill_tx.send(FillEvent::Rebase { pnl, trades: completed }).await;
+                    }
+                    Err(e) => tracing::debug!("P&L rebase fetch failed: {e}"),
+                }
+            }
+
             if bot_has_pos {
-                // Bot thinks open, server is flat — external bracket fill
+                // Bot thinks open, server is flat — SL or TP bracket filled externally.
+                // Cancel the surviving bracket leg before notifying the bot.
                 tracing::info!("sync_from_server: server flat but bot has position → ExternalClose");
-                let bar_idx = {
-                    let st = state.read().await;
-                    // Use bar count as proxy for bar_idx
-                    st.session.as_ref().map(|s| s.bars.len() as i64).unwrap_or(0)
-                };
+                let dir = state.read().await.bot.pos.as_ref().map(|p| {
+                    if p.dir == "LONG" { Direction::Long } else { Direction::Short }
+                });
+                if let Some(dir) = dir {
+                    if let Err(e) = oc.cancel_all_brackets(dir).await {
+                        tracing::warn!("cancel_all_brackets on external close failed: {e}");
+                    }
+                }
+                let bar_idx = state.read().await
+                    .session.as_ref().map(|s| s.bars.len() as i64).unwrap_or(0);
                 let last_price = state.read().await.live.last;
                 *active_pos_uuid = None;
                 *orphan_confirm = 0;
@@ -471,7 +582,7 @@ async fn sync_from_server(
                         .and_then(|s| close_action_from_side(s))
                         .unwrap_or("SELL");
 
-                    if !DRY_RUN {
+                    if !is_dry {
                         let ref_price = if let Some(p) = avg_price {
                             p
                         } else {

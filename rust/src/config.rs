@@ -1,6 +1,10 @@
+#![allow(dead_code)]
 pub const API: &str = "https://api.topstepx.com/api";
 pub const HUB: &str = "https://rtc.topstepx.com/hubs/market";
-pub const CONTRACT: &str = "CON.F.US.EP.M26";
+pub const USER_HUB: &str = "https://rtc.topstepx.com/hubs/user";
+pub const CONTRACT: &str = "CON.F.US.EP.U26";
+pub const NQ_CONTRACT: &str = "CON.F.US.ENQ.U26";
+pub const NQ_TICK_VALUE: f64 = 5.0;
 pub const VX_CONTRACT: &str = "CON.F.US.VX.M26";
 pub const DATA_DIR: &str = "es_sessions";
 pub const TICK_DIR: &str = "es_ticks";

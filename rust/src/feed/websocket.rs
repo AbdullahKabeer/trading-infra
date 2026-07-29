@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Datelike, NaiveTime, TimeZone, Timelike, Utc, Weekday};
+use chrono::{Datelike, NaiveTime, Timelike, Utc, Weekday};
 use chrono_tz::America::New_York;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::api::history::backfill;
 use crate::config::{CONTRACT, HUB};
 use crate::market::session::Session;
-use crate::types::{AppState, BarEvent, LiveQuote, TickEvent};
+use crate::types::{AppState, BarEvent, DomLevel, LiveQuote, TickEvent};
 
 const SIGNALR_SEP: char = '\x1e';
 
@@ -93,9 +93,10 @@ async fn connect_and_stream(
     let subs = [
         format!(r#"{{"type":1,"target":"SubscribeContractQuotes","arguments":["{CONTRACT}"],"invocationId":"1"}}{SIGNALR_SEP}"#),
         format!(r#"{{"type":1,"target":"SubscribeContractTrades","arguments":["{CONTRACT}"],"invocationId":"2"}}{SIGNALR_SEP}"#),
+        format!(r#"{{"type":1,"target":"SubscribeContractMarketDepth","arguments":["{CONTRACT}"],"invocationId":"3"}}{SIGNALR_SEP}"#),
     ];
     for s in &subs { write.send(Message::Text(s.clone())).await?; }
-    tracing::info!("✓ Live stream active ({})", CONTRACT);
+    tracing::info!("✓ Live stream active ({}) + DOM", CONTRACT);
 
     // Message loop
     while let Some(msg) = read.next().await {
@@ -119,6 +120,7 @@ async fn connect_and_stream(
                 match target {
                     "GatewayTrade" => on_trade(args, rth, state, bar_tx, tick_tx).await,
                     "GatewayQuote" => on_quote(args, rth, state).await,
+                    "GatewayDepth" => on_depth(args, state).await,
                     _ => {}
                 }
             }
@@ -142,6 +144,7 @@ async fn on_trade(
 
     let now = Utc::now();
     let mut st = state.write().await;
+    st.last_feed_secs = now.timestamp() as u64;
 
     // Update live last price even outside RTH
     for td in &dicts {
@@ -150,8 +153,7 @@ async fn on_trade(
         }
     }
 
-    if !rth { return; }
-    st.rth = true;
+    st.rth = rth;
 
     // Ensure session exists
     let today = now.with_timezone(&New_York).format("%Y-%m-%d").to_string();
@@ -224,9 +226,6 @@ async fn on_trade(
         let vwap_slope = snap_vwap - bars.iter().rev().nth(1).map(|b| b.vwap).unwrap_or(snap_vwap);
 
         // Release write lock before sending
-        let live_bid = sess.bid;
-        let live_ask = sess.ask;
-        let live_last = sess.last;
         drop(st);
 
         let bar_ev = BarEvent {
@@ -251,16 +250,16 @@ async fn on_trade(
     st.live = LiveQuote { bid: sess.bid, ask: sess.ask, last: sess.last };
 }
 
-async fn on_quote(args: Vec<serde_json::Value>, rth: bool, state: &Arc<RwLock<AppState>>) {
+async fn on_quote(args: Vec<serde_json::Value>, _rth: bool, state: &Arc<RwLock<AppState>>) {
     let now = Utc::now();
     let mut st = state.write().await;
+    st.last_feed_secs = now.timestamp() as u64;
     for item in &args {
         if !item.is_object() { continue; }
         if let Some(b) = item["bestBid"].as_f64() { if b > 0.0 { st.live.bid = b; } }
         if let Some(a) = item["bestAsk"].as_f64() { if a > 0.0 { st.live.ask = a; } }
         if st.live.bid > 0.0 && st.live.ask > 0.0 { st.live.last = (st.live.bid + st.live.ask) / 2.0; }
     }
-    if !rth { return; }
     if let Some(ref mut sess) = st.session {
         for item in &args {
             if item.is_object() {
@@ -283,6 +282,43 @@ fn parse_side(val: &serde_json::Value) -> String {
             else { u };
     }
     String::new()
+}
+
+async fn on_depth(args: Vec<serde_json::Value>, state: &Arc<RwLock<AppState>>) {
+    // GatewayDepth payload: { timestamp, type, price, volume, currentVolume }
+    // type: 1=Ask 2=Bid 3=BestAsk 4=BestBid 6=Reset 9=NewBestBid 10=NewBestAsk
+    let mut st = state.write().await;
+    for item in &args {
+        if !item.is_object() { continue; }
+        let dom_type = item["type"].as_i64().unwrap_or(0);
+        let price = match item["price"].as_f64() { Some(p) if p > 0.0 => p, _ => continue };
+        let volume = item["volume"].as_f64().unwrap_or(0.0);
+
+        if dom_type == 6 {
+            // Reset — clear the DOM
+            st.dom.clear();
+            continue;
+        }
+
+        let is_bid = matches!(dom_type, 2 | 4 | 9);
+        let is_ask = matches!(dom_type, 1 | 3 | 10);
+        if !is_bid && !is_ask { continue; }
+
+        if let Some(level) = st.dom.iter_mut().find(|l| (l.price - price).abs() < 0.001) {
+            if is_bid { level.bid_vol = volume; }
+            if is_ask { level.ask_vol = volume; }
+        } else {
+            let mut level = DomLevel { price, bid_vol: 0.0, ask_vol: 0.0 };
+            if is_bid { level.bid_vol = volume; }
+            if is_ask { level.ask_vol = volume; }
+            st.dom.push(level);
+            // Keep DOM bounded — top 20 price levels sorted by price desc
+            if st.dom.len() > 40 {
+                st.dom.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+                st.dom.truncate(40);
+            }
+        }
+    }
 }
 
 pub fn is_rth() -> bool {

@@ -68,6 +68,47 @@ fn extract_side(p: &serde_json::Value) -> Option<serde_json::Value> {
     None
 }
 
+#[allow(dead_code)]
+pub async fn close_contract(
+    client: &Client,
+    bearer: &str,
+    account_id: i64,
+    contract_id: &str,
+) -> Result<bool> {
+    let resp: serde_json::Value = client
+        .post(format!("{}/Position/closeContract", crate::config::API))
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "accountId": account_id, "contractId": contract_id }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(resp["success"].as_bool().unwrap_or(false))
+}
+
+#[allow(dead_code)]
+pub async fn partial_close_contract(
+    client: &Client,
+    bearer: &str,
+    account_id: i64,
+    contract_id: &str,
+    size: u32,
+) -> Result<bool> {
+    let resp: serde_json::Value = client
+        .post(format!("{}/Position/partialCloseContract", crate::config::API))
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({
+            "accountId": account_id,
+            "contractId": contract_id,
+            "size": size,
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(resp["success"].as_bool().unwrap_or(false))
+}
+
 /// Returns the close action ("BUY" or "SELL") from a server-side position side value.
 pub fn close_action_from_side(side: &serde_json::Value) -> Option<&'static str> {
     if let Some(n) = side.as_i64() {

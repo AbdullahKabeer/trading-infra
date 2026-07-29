@@ -1,5 +1,4 @@
-use anyhow::Result;
-use chrono::{Utc, Datelike, Duration};
+use chrono::{Utc, Duration};
 use reqwest::Client;
 use crate::config::{API, HIGH_IMPACT_BEHAVIOR, VX_CONTRACT, VWAP_CROSS_TRENDING, VWAP_CROSS_BALANCED};
 use crate::types::RegimeState;
@@ -58,6 +57,7 @@ impl RegimeState {
         tracing::info!("Session type at bar={bar_idx}: {}", self.session_type);
     }
 
+    #[allow(dead_code)]
     pub fn reset_for_new_day(&mut self) {
         self.vwap_crossings = 0;
         self.session_type = "NEUTRAL".to_string();

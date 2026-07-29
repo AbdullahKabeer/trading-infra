@@ -22,7 +22,7 @@ pub fn run_backtest(
     let mut trades_today: u32 = 0;
     let mut peak_pnl = 0.0f64;
     let mut max_dd = 0.0f64;
-    let mut peak_eod_balance = ACCOUNT_START_BALANCE;
+    let peak_eod_balance = ACCOUNT_START_BALANCE;
 
     // Position state
     let mut pos_dir: Option<&'static str> = None; // "LONG" or "SHORT"
@@ -140,7 +140,7 @@ pub fn run_backtest(
                         pnl: pnl - COMMISSION_RT * pos_contracts as f64,
                         bar_idx,
                         reason: "GUTTER WIN".into(),
-                        size: pos_contracts,
+                        size: pos_contracts, sl: 0.0, tp: 0.0,
                     });
                     last_exit_bar = bar_idx;
                     pos_dir = None;
@@ -164,7 +164,7 @@ pub fn run_backtest(
                             pnl: pnl - COMMISSION_RT,
                             bar_idx,
                             reason: "SCALE OUT".into(),
-                            size: 1,
+                            size: 1, sl: 0.0, tp: 0.0,
                         });
                         pos_contracts -= 1;
                         pos_scale1_done = true;
@@ -186,7 +186,7 @@ pub fn run_backtest(
                             pnl: net,
                             bar_idx,
                             reason: reason.to_string(),
-                            size: pos_contracts,
+                            size: pos_contracts, sl: 0.0, tp: 0.0,
                         });
                         last_exit_bar = bar_idx;
                         pos_dir = None;
@@ -299,7 +299,7 @@ pub fn run_backtest(
                 pnl: 0.0,
                 bar_idx,
                 reason: String::new(),
-                size: 1,
+                size: 1, sl: sl_price, tp: tp_price,
             });
         }
     }
@@ -317,7 +317,7 @@ pub fn run_backtest(
             pnl: pnl - COMMISSION_RT * pos_contracts as f64,
             bar_idx,
             reason: "END OF DATA".into(),
-            size: pos_contracts,
+            size: pos_contracts, sl: 0.0, tp: 0.0,
         });
     }
 

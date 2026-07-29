@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use tokio::time::Instant;
 use uuid::Uuid;
 
 // ── Market data ───────────────────────────────────────────────────────────────
@@ -50,8 +49,17 @@ pub struct LiveQuote {
     pub last: f64,
 }
 
+/// One level in the Depth-of-Market (DOM) book.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DomLevel {
+    pub price: f64,
+    pub bid_vol: f64,
+    pub ask_vol: f64,
+}
+
 // ── Session ───────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub date: String,
@@ -139,6 +147,8 @@ pub struct TradeRecord {
     pub bar_idx: i64,
     pub reason: String,
     pub size: u32,
+    pub sl: f64,
+    pub tp: f64,
 }
 
 /// Read-only snapshot written to AppState for TUI/Web display
@@ -163,15 +173,24 @@ pub struct BotSnapshot {
     pub z_history: Vec<f64>,
     pub delta_history: Vec<f64>,
     pub atr_sparkline: Vec<f64>,
+    pub hourly_pnl: f64,
+    pub is_locked_down: bool,
+    pub strategy: String,
+    // State machine & execution quality
+    pub bot_state: String,       // "HUNTING" | "ENTERING" | "MANAGING_LONG" | "TRAILING_LONG" | "COOLDOWN" | "HALTED"
+    pub avg_slippage_ticks: f64, // positive = got filled better than signal; negative = paid more
+    pub pos_age_secs: u64,       // seconds since current position was opened
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionSnapshot {
+    pub uuid: Uuid,
     pub dir: String,
     pub ep: f64,
     pub sl: f64,
     pub tp: f64,
     pub contracts_remaining: u32,
+    pub bar_idx: i64,
 }
 
 // ── Regime ────────────────────────────────────────────────────────────────────
@@ -193,7 +212,7 @@ pub struct RegimeState {
 
 // ── Shared app state (written by actors, read by TUI/web) ─────────────────────
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct AppState {
     pub session: Option<crate::market::session::Session>,
     pub bot: BotSnapshot,
@@ -204,10 +223,44 @@ pub struct AppState {
     pub target_mode: String,
     pub time_stop_mins: i64,
     pub rth: bool,
+    // Runtime control flags — written by TUI, read by bot/order_manager
+    pub bot_enabled: bool,
+    pub dry_run: bool,
+    // Historical bars from prior sessions (loaded at startup, oldest-first)
+    pub historical_bars: Vec<Bar>,
+    // Live DOM from market hub GatewayDepth (bid levels and ask levels merged, keyed by price)
+    pub dom: Vec<DomLevel>,
+    // Real-time account balance pushed by user hub GatewayUserAccount
+    pub account_balance_live: Option<f64>,
+    /// Unix seconds of last broker message received (used for feed health indicator)
+    pub last_feed_secs: u64,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            session: None,
+            bot: BotSnapshot::default(),
+            regime: RegimeState::default(),
+            connected: false,
+            live: LiveQuote::default(),
+            log: VecDeque::new(),
+            target_mode: "vwap".to_string(),
+            time_stop_mins: crate::config::TIME_STOP_MINS,
+            rth: false,
+            bot_enabled: crate::config::BOT_ACTIVE,
+            dry_run: crate::config::DRY_RUN,
+            historical_bars: Vec::new(),
+            dom: Vec::new(),
+            account_balance_live: None,
+            last_feed_secs: 0,
+        }
+    }
 }
 
 // ── Channel messages ──────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BarEvent {
     pub bar_idx: i64,
@@ -246,6 +299,7 @@ pub struct BarEvent {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TickEvent {
     pub price: f64,
     pub vwap: f64,
@@ -258,6 +312,7 @@ pub struct TickEvent {
 }
 
 /// Commands from Strategy → OrderManager
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TradeCommand {
     Enter {
@@ -338,6 +393,8 @@ pub enum FillEvent {
     },
     ActiveOrders(Vec<serde_json::Value>),
     Error(String),
+    /// Broker-authoritative daily P&L rebase (fired when flat, every ~60s)
+    Rebase { pnl: f64, trades: u32 },
 }
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
@@ -387,8 +444,53 @@ pub struct MonteCarloCurve {
     pub p95: Vec<f64>,
 }
 
+// ── Live strategy selection ────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveStrategy {
+    VwapReclaim,   // ES — fade VWAP crossovers
+    FirstPullback, // NQ — enter on pullback toward VWAP from extension
+}
+
+impl LiveStrategy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LiveStrategy::VwapReclaim   => "VWAP Reclaim",
+            LiveStrategy::FirstPullback => "First Pullback",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstrumentCfg {
+    pub tick_size: f64,
+    pub tick_value: f64,
+    pub daily_profit_cap: f64,
+    pub contract: &'static str,
+}
+
+impl InstrumentCfg {
+    pub fn es() -> Self {
+        Self {
+            tick_size: crate::config::TICK_SIZE,
+            tick_value: crate::config::TICK_VALUE,
+            daily_profit_cap: 1499.0,
+            contract: crate::config::CONTRACT,
+        }
+    }
+    pub fn nq() -> Self {
+        Self {
+            tick_size: crate::config::TICK_SIZE,
+            tick_value: crate::config::NQ_TICK_VALUE,
+            daily_profit_cap: 1499.0,
+            contract: crate::config::NQ_CONTRACT,
+        }
+    }
+}
+
 // ── Server-side position snapshot ─────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ServerPositionState {
     Flat,

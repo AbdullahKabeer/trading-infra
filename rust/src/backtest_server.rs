@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-use crate::backtest_runner::{run_backtest_pub, BtConfig, DayResult};
+use crate::backtest_runner::{monte_carlo_pass, run_backtest_pub, run_stat_tests, BtConfig};
 
 // ── API types ──────────────────────────────────────────────────────────────────
 
@@ -34,6 +34,10 @@ pub struct ApiParams {
     pub daily_profit_cap: Option<f64>,
     pub daily_loss_limit: Option<f64>,
     pub profit_target: Option<f64>,
+    pub strategy: Option<String>,
+    pub orb_bars: Option<i64>,
+    pub orb_target_mult: Option<f64>,
+    pub slippage_ticks: Option<f64>,
 }
 
 impl ApiParams {
@@ -57,6 +61,10 @@ impl ApiParams {
         if let Some(v) = self.daily_profit_cap { cfg.daily_profit_cap = v; }
         if let Some(v) = self.daily_loss_limit { cfg.daily_loss_limit = v; }
         if let Some(v) = self.profit_target { cfg.profit_target = v; }
+        if let Some(ref v) = self.strategy { cfg.strategy = v.clone(); }
+        if let Some(v) = self.orb_bars { cfg.orb_bars = v; }
+        if let Some(v) = self.orb_target_mult { cfg.orb_target_mult = v; }
+        if let Some(v) = self.slippage_ticks { cfg.slippage_ticks = v; }
         let dir = self.dir.clone().unwrap_or_else(|| default_dir.to_string());
         (cfg, dir)
     }
@@ -77,6 +85,49 @@ pub struct ApiStats {
     pub avg_trades_day: f64,
     pub active_days: usize,
     pub n_sessions: usize,
+}
+
+#[derive(Serialize, Default)]
+pub struct ApiMonteCarlo {
+    pub pass_rate: f64,
+    pub fail_rate: f64,
+    pub timeout_rate: f64,
+    pub avg_days_to_pass: f64,
+    pub avg_days_to_fail: f64,
+    pub n_sims: usize,
+    pub p5: Vec<f64>,
+    pub p50: Vec<f64>,
+    pub p95: Vec<f64>,
+    // Gambler's ruin analytical baseline (zero-EV)
+    pub zero_ev_pass_rate: f64,
+}
+
+#[derive(Serialize, Default)]
+pub struct ApiStatTests {
+    pub n_days: usize,
+    pub n_trades: usize,
+    pub mean_daily_pnl: f64,
+    pub std_daily_pnl: f64,
+    pub t_stat: f64,
+    pub p_value_mean: f64,
+    pub ci_mean_lo: f64,
+    pub ci_mean_hi: f64,
+    pub cohens_d: f64,
+    pub win_rate_ci_lo: f64,
+    pub win_rate_ci_hi: f64,
+    pub p_value_winrate: f64,
+    pub pass_rate_ci_lo: f64,
+    pub pass_rate_ci_hi: f64,
+    pub p_value_passrate: f64,
+    pub power_at_current_n: f64,
+    pub n_required_80_power: usize,
+    pub sample_adequate: bool,
+    pub market_correlation: f64,
+    pub market_corr_pvalue: f64,
+    pub market_beta: f64,
+    pub market_alpha: f64,
+    pub market_corr_ci_lo: f64,
+    pub market_corr_ci_hi: f64,
 }
 
 #[derive(Serialize, Default)]
@@ -111,6 +162,8 @@ pub struct ApiResponse {
     pub error: String,
     pub stats: ApiStats,
     pub prop_firm: ApiPropFirm,
+    pub mc: ApiMonteCarlo,
+    pub stat_tests: ApiStatTests,
     pub equity_curve: Vec<f64>,
     pub mll_curve: Vec<f64>,
     pub labels: Vec<String>,
@@ -201,6 +254,57 @@ async fn run_handler(
         consistency_violation: d.daily_pnl >= consistency_threshold,
     }).collect();
 
+    let stat_tests = {
+        let active_pnls: Vec<f64> = day_results.iter()
+            .filter(|d| d.trades > 0)
+            .map(|d| d.daily_pnl)
+            .collect();
+        // Market return per active day: session open→close move (proxy for daily directional exposure)
+        let mkt_map: std::collections::HashMap<&str, f64> = sessions.iter().filter_map(|s| {
+            Some((s.date.as_str(), s.bars.last()?.c - s.bars.first()?.c))
+        }).collect();
+        let active_mkt: Vec<f64> = day_results.iter()
+            .filter(|d| d.trades > 0)
+            .map(|d| *mkt_map.get(d.date.as_str()).unwrap_or(&0.0))
+            .collect();
+        let zero_ev = cfg.trailing_mll / (cfg.trailing_mll + cfg.profit_target);
+        let st = run_stat_tests(
+            &active_pnls,
+            &active_mkt,
+            result.wins,
+            result.losses,
+            0.0,
+            zero_ev,
+            &cfg,
+        );
+        ApiStatTests {
+            n_days: st.n_days,
+            n_trades: st.n_trades,
+            mean_daily_pnl: st.mean_daily_pnl,
+            std_daily_pnl: st.std_daily_pnl,
+            t_stat: st.t_stat,
+            p_value_mean: st.p_value_mean,
+            ci_mean_lo: st.ci_mean_lo,
+            ci_mean_hi: st.ci_mean_hi,
+            cohens_d: st.cohens_d,
+            win_rate_ci_lo: st.win_rate_ci_lo,
+            win_rate_ci_hi: st.win_rate_ci_hi,
+            p_value_winrate: st.p_value_winrate,
+            pass_rate_ci_lo: st.pass_rate_ci_lo,
+            pass_rate_ci_hi: st.pass_rate_ci_hi,
+            p_value_passrate: st.p_value_passrate,
+            power_at_current_n: st.power_at_current_n,
+            n_required_80_power: st.n_required_80_power,
+            sample_adequate: st.sample_adequate,
+            market_correlation: st.market_correlation,
+            market_corr_pvalue: st.market_corr_pvalue,
+            market_beta: st.market_beta,
+            market_alpha: st.market_alpha,
+            market_corr_ci_lo: st.market_corr_ci_lo,
+            market_corr_ci_hi: st.market_corr_ci_hi,
+        }
+    };
+
     (StatusCode::OK, Json(ApiResponse {
         ok: true,
         error: String::new(),
@@ -229,6 +333,25 @@ async fn run_handler(
             mll_breach_days,
             mll_distance: cfg.trailing_mll,
         },
+        mc: {
+            let daily_pnls: Vec<f64> = day_results.iter().map(|d| d.daily_pnl).collect();
+            let mc = monte_carlo_pass(&daily_pnls, &cfg);
+            // Gambler's ruin zero-EV baseline: P(pass) = MLL / (MLL + target)
+            let zero_ev = cfg.trailing_mll / (cfg.trailing_mll + cfg.profit_target);
+            ApiMonteCarlo {
+                pass_rate: mc.pass_rate,
+                fail_rate: mc.fail_rate,
+                timeout_rate: mc.timeout_rate,
+                avg_days_to_pass: mc.avg_days_to_pass,
+                avg_days_to_fail: mc.avg_days_to_fail,
+                n_sims: mc.n_sims,
+                p5: mc.p5,
+                p50: mc.p50,
+                p95: mc.p95,
+                zero_ev_pass_rate: zero_ev,
+            }
+        },
+        stat_tests,
         equity_curve,
         mll_curve,
         labels,
@@ -276,6 +399,8 @@ impl Default for ApiResponse {
             ok: false, error: String::new(),
             stats: ApiStats::default(),
             prop_firm: ApiPropFirm::default(),
+            mc: ApiMonteCarlo::default(),
+            stat_tests: ApiStatTests::default(),
             equity_curve: vec![], mll_curve: vec![], labels: vec![], days: vec![],
         }
     }
@@ -334,6 +459,19 @@ tr:hover td{background:#21262d}
 .tag-ltd{background:#3d1a1a;color:#f85149}
 .tag-con{background:#4d2d00;color:#d29922}
 .section-hd{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.mc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:6px}
+.mc-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px}
+.mc-card .lbl{color:#8b949e;font-size:10px;margin-bottom:2px;text-transform:uppercase}
+.mc-card .val{font-size:18px;font-weight:700}
+.mc-card .sub{color:#8b949e;font-size:10px;margin-top:2px}
+.mc-pass .val{color:#3fb950}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:6px}
+.stat-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px}
+.stat-card .lbl{color:#8b949e;font-size:10px;margin-bottom:2px;text-transform:uppercase}
+.stat-card .val{font-size:14px;font-weight:700}
+.stat-card .sub{color:#8b949e;font-size:10px;margin-top:2px}
+.sig{color:#3fb950}.insig{color:#f85149}.marg{color:#d29922}
+.warn-box{background:#2d1f00;border:1px solid #d29922;border-radius:6px;padding:8px 10px;color:#d29922;font-size:11px;margin-bottom:6px}
 </style>
 </head>
 <body>
@@ -357,6 +495,51 @@ tr:hover td{background:#21262d}
 <div class="param-row">
   <div class="lbl">Tick Value <span id="tv_val">$12.50</span></div>
   <input type="range" id="tick_value" min="5" max="12.5" step="7.5" value="12.5" oninput="syncVal('tv','tick_value',2,'$')">
+</div>
+</div>
+
+<hr class="sep">
+<div>
+<h2>Strategy</h2>
+<select id="strategy" onchange="updateStrategy()">
+  <optgroup label="── High Conviction ──">
+  <option value="first_pullback">First Pullback ★</option>
+  <option value="bar_rejection">Bar Rejection (candlestick)</option>
+  <option value="z_cross">Z-Cross Confirmation</option>
+  <option value="quiet_fade">Quiet Fade (low volume)</option>
+  <option value="delta_fade">Delta Fade (order flow)</option>
+  </optgroup>
+  <optgroup label="── VWAP Fades ──">
+  <option value="fade">VWAP Mean Reversion</option>
+  <option value="vwap_reclaim">VWAP Reclaim Fade</option>
+  </optgroup>
+  <optgroup label="── Statistical ──">
+  <option value="ou_vwap">OU/VWAP Mean Reversion</option>
+  </optgroup>
+  <optgroup label="── Experimental ──">
+  <option value="exhaust">Exhaustion Fade</option>
+  <option value="regime">Adaptive Regime (Hurst)</option>
+  <option value="kalman">Kalman Filter Fade</option>
+  <option value="opening_drive">Opening Drive</option>
+  <option value="trend">VWAP Trend Follow</option>
+  <option value="orb">Opening Range Breakout</option>
+  </optgroup>
+</select>
+<div id="orb_params" style="display:none">
+<div class="param-row">
+  <div class="lbl">ORB Bars (minutes) <span id="ob_val">30</span></div>
+  <input type="range" id="orb_bars" min="5" max="60" step="5" value="30" oninput="syncVal('ob','orb_bars',0)">
+</div>
+<div class="param-row">
+  <div class="lbl">ORB Target Mult <span id="om_val">1.00</span></div>
+  <input type="range" id="orb_target_mult" min="0.5" max="3.0" step="0.25" value="1.0" oninput="syncVal('om','orb_target_mult',2)">
+</div>
+</div>
+<div id="ou_info" style="display:none;background:#0d2137;border:1px solid #1f6feb;border-radius:6px;padding:8px 10px;font-size:10px;color:#79c0ff;line-height:1.6;margin-top:6px">
+  <strong style="color:#58a6ff">OU/VWAP</strong> — Ornstein-Uhlenbeck mean reversion on VWAP residual.<br>
+  Entry/exit thresholds derived via Bertram (2010) analytic optimisation.<br>
+  <span style="color:#8b949e">Z Threshold · ATR Stop · Trail · Scale Out are ignored.<br>
+  ADF regime gate + half-life window + cost gate control activity.</span>
 </div>
 </div>
 
@@ -408,7 +591,11 @@ tr:hover td{background:#21262d}
 
 <hr class="sep">
 <div>
-<h2>Risk (Prop Firm)</h2>
+<h2>Risk &amp; Friction</h2>
+<div class="param-row">
+  <div class="lbl">Slippage (ticks RT) <span id="slip_val">0.0</span></div>
+  <input type="range" id="slippage_ticks" min="0" max="2" step="0.25" value="0" oninput="syncVal('slip','slippage_ticks',2)">
+</div>
 <div class="param-row">
   <div class="lbl">Max Trades/Day <span id="mt_val">11</span></div>
   <input type="range" id="max_trades" min="1" max="15" step="1" value="11" oninput="syncVal('mt','max_trades',0)">
@@ -418,8 +605,8 @@ tr:hover td{background:#21262d}
   <input type="range" id="daily_loss_limit" min="0" max="2000" step="50" value="0" oninput="syncDll()">
 </div>
 <div class="param-row">
-  <div class="lbl">Daily Profit Cap ($) <span id="dpc_val">OFF</span></div>
-  <input type="range" id="daily_profit_cap" min="0" max="3000" step="50" value="0" oninput="syncDpc()">
+  <div class="lbl">Daily Profit Cap ($) <span id="dpc_val">$1500</span></div>
+  <input type="range" id="daily_profit_cap" min="0" max="3000" step="50" value="1500" oninput="syncDpc()">
 </div>
 </div>
 
@@ -464,12 +651,21 @@ function updateDir(){
   if(d.includes('nq')){document.getElementById('tick_value').value=5;document.getElementById('tv_val').textContent='$5.00';}
   else{document.getElementById('tick_value').value=12.5;document.getElementById('tv_val').textContent='$12.50';}
 }
+function updateStrategy(){
+  const s=document.getElementById('strategy').value;
+  document.getElementById('orb_params').style.display=s==='orb'?'block':'none';
+  document.getElementById('ou_info').style.display=s==='ou_vwap'?'block':'none';
+}
 function getParams(){
   const g=id=>parseFloat(document.getElementById(id).value);
   const dll=g('daily_loss_limit');
   const dpc=g('daily_profit_cap');
   return{
     dir:document.getElementById('dir').value,
+    strategy:document.getElementById('strategy').value,
+    orb_bars:parseInt(g('orb_bars')),
+    orb_target_mult:g('orb_target_mult'),
+    slippage_ticks:g('slippage_ticks'),
     z_thresh:g('z_thresh'),
     atr_stop_ratio:g('atr_stop_ratio'),
     min_stop_ticks:parseInt(g('min_stop_ticks')),
@@ -504,9 +700,8 @@ async function run(){
 }
 
 function render(d){
-  const s=d.stats;const p=d.prop_firm;
+  const s=d.stats;const p=d.prop_firm;const mc=d.mc||{};const st=d.stat_tests||{};
   document.getElementById('sessionInfo').textContent=d.labels[0]+' → '+d.labels[d.labels.length-1]+'  ·  '+s.n_sessions+' days';
-  document.getElementById('placeholder').style.display='none';
 
   const cl=v=>v>0?'pos':v<0?'neg':'neu';
   const html=`
@@ -528,6 +723,81 @@ function render(d){
   <div class="prop-card"><div class="lbl">Best Day</div><div class="val ${p.best_day>=p.consistency_threshold?'fail':'pass'}">${fmtDollar(p.best_day)}</div></div>
   ${p.loss_limit_days>0?`<div class="prop-card"><div class="lbl">Daily Loss Limit Hits</div><div class="val warn">${p.loss_limit_days} days stopped</div></div>`:''}
   ${p.capped_days>0?`<div class="prop-card"><div class="lbl">Daily Cap Hits</div><div class="val neu">${p.capped_days} days capped</div></div>`:''}
+</div>
+<div class="section-hd" style="margin:4px 0 6px">Monte Carlo · 10,000 Simulations</div>
+<div class="mc-grid">
+  <div class="mc-card mc-pass">
+    <div class="lbl">Pass Rate</div>
+    <div class="val">${mc.pass_rate!=null?(mc.pass_rate*100).toFixed(1)+'%':'—'}</div>
+    <div class="sub">vs ${mc.zero_ev_pass_rate!=null?(mc.zero_ev_pass_rate*100).toFixed(0):'40'}% zero-EV baseline</div>
+  </div>
+  <div class="mc-card">
+    <div class="lbl">Fail Rate</div>
+    <div class="val neg">${mc.fail_rate!=null?(mc.fail_rate*100).toFixed(1)+'%':'—'}</div>
+    <div class="sub">sim MLL breach</div>
+  </div>
+  <div class="mc-card">
+    <div class="lbl">Timeout Rate</div>
+    <div class="val warn">${mc.timeout_rate!=null?(mc.timeout_rate*100).toFixed(1)+'%':'—'}</div>
+    <div class="sub">&gt;60 days</div>
+  </div>
+  <div class="mc-card">
+    <div class="lbl">Avg Days to Pass</div>
+    <div class="val ${mc.avg_days_to_pass>0?'pos':'neg'}">${mc.avg_days_to_pass>0?mc.avg_days_to_pass.toFixed(1)+' days':'N/A'}</div>
+    <div class="sub">when passing</div>
+  </div>
+</div>
+<div class="section-hd" style="margin:4px 0 6px">Statistical Significance</div>
+${!st.sample_adequate?`<div class="warn-box">⚠ Small sample (${st.n_days} active days). Results below are estimates — normal approximation is valid for n≥30. Confidence intervals are wide; interpret with caution.</div>`:''}
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="lbl">Mean Daily P&L</div>
+    <div class="val ${st.mean_daily_pnl>0?'pos':'neg'}">${fmtDollar(st.mean_daily_pnl)}</div>
+    <div class="sub">95% CI [${fmtDollar(st.ci_mean_lo)}, ${fmtDollar(st.ci_mean_hi)}]</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">t-stat / p-value (EV&gt;0)</div>
+    <div class="val ${st.p_value_mean<0.05?'sig':st.p_value_mean<0.1?'marg':'insig'}">${st.t_stat!=null?st.t_stat.toFixed(2):'—'} / ${st.p_value_mean<0.001?'<0.001':st.p_value_mean!=null?st.p_value_mean.toFixed(3):'—'}</div>
+    <div class="sub">${st.p_value_mean<0.05?'✓ significant α=0.05':st.p_value_mean<0.1?'marginal α=0.10':'✗ not significant'}</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Cohen\'s d (effect size)</div>
+    <div class="val ${st.cohens_d>0.5?'sig':st.cohens_d>0.2?'marg':'insig'}">${st.cohens_d!=null?st.cohens_d.toFixed(3):'—'}</div>
+    <div class="sub">${st.cohens_d>0.8?'large':st.cohens_d>0.5?'medium':st.cohens_d>0.2?'small':'negligible'}</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Win Rate 95% CI</div>
+    <div class="val neu">[${st.win_rate_ci_lo!=null?(st.win_rate_ci_lo*100).toFixed(1):'—'}%, ${st.win_rate_ci_hi!=null?(st.win_rate_ci_hi*100).toFixed(1):'—'}%]</div>
+    <div class="sub">p=${st.p_value_winrate<0.001?'<0.001':st.p_value_winrate!=null?st.p_value_winrate.toFixed(3):'—'} vs 50% H₀</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Pass Rate 95% CI</div>
+    <div class="val ${st.pass_rate_ci_lo!=null&&st.pass_rate_ci_lo*100>40?'sig':'marg'}">[${st.pass_rate_ci_lo!=null?(st.pass_rate_ci_lo*100).toFixed(1):'—'}%, ${st.pass_rate_ci_hi!=null?(st.pass_rate_ci_hi*100).toFixed(1):'—'}%]</div>
+    <div class="sub">bootstrap p=${st.p_value_passrate<0.001?'<0.001':st.p_value_passrate!=null?st.p_value_passrate.toFixed(3):'—'} vs zero-EV</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Power / Required n</div>
+    <div class="val ${st.power_at_current_n>0.8?'sig':st.power_at_current_n>0.5?'marg':'insig'}">${st.power_at_current_n!=null?(st.power_at_current_n*100).toFixed(0):'—'}% / ${st.n_required_80_power!=null?st.n_required_80_power:9999} days</div>
+    <div class="sub">power at current n · need for 80% power</div>
+  </div>
+</div>
+<div class="section-hd" style="margin:6px 0 4px">Market Correlation · strat P&amp;L vs session move</div>
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="lbl">Pearson r</div>
+    <div class="val ${Math.abs(st.market_correlation||0)<0.3?'sig':Math.abs(st.market_correlation||0)<0.5?'marg':'insig'}">${(st.market_correlation||0).toFixed(3)}</div>
+    <div class="sub">95% CI [${(st.market_corr_ci_lo||0).toFixed(3)}, ${(st.market_corr_ci_hi||0).toFixed(3)}]</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">p-value (H₀: r=0)</div>
+    <div class="val ${(st.market_corr_pvalue||1)<0.05?'insig':(st.market_corr_pvalue||1)<0.1?'marg':'sig'}">${(st.market_corr_pvalue||1)<0.001?'<0.001':(st.market_corr_pvalue||1).toFixed(3)}</div>
+    <div class="sub">${(st.market_corr_pvalue||1)<0.05?'✗ market-exposed':'✓ market-neutral'}</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Beta / Alpha</div>
+    <div class="val neu">${(st.market_beta||0).toFixed(3)} / ${(st.market_alpha||0)>=0?'+':''}$${Math.abs(st.market_alpha||0).toFixed(0)}</div>
+    <div class="sub">$P&amp;L = α + β × session_move</div>
+  </div>
 </div>
 <div class="chart-area">
   <canvas id="chart"></canvas>

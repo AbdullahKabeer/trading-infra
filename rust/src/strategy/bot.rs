@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
-use uuid::Uuid;
-
 use crate::config::*;
 use crate::types::*;
 
@@ -25,22 +23,33 @@ pub struct BotState {
     pub gutter_win: bool,
     pub gutter_loss: bool,
     pub account_name: Option<String>,
-    pub account_id: Option<i64>,
-    pub contract_id: Option<String>,
+    #[allow(dead_code)] pub account_id: Option<i64>,
+    #[allow(dead_code)] pub contract_id: Option<String>,
     pub open_pnl: f64,
+    pub instrument: InstrumentCfg,
+    pub strategy: LiveStrategy,
+    // vwap_reclaim state
+    pub prev_above_vwap: bool,
+    // first_pullback state
+    pub prev_z: f64,
+    pub prev_close: f64,
+    // execution quality
+    pub entry_signal_price: f64,   // price at which signal fired (for slippage calc)
+    pub slippage_ticks: Vec<f64>,  // rolling last-20 trades; positive = filled better than signal
+    pub last_bar_idx: i64,         // most recent bar seen (for cooldown display)
 }
 
 impl BotState {
-    pub fn new() -> Self {
+    pub fn new(strategy: LiveStrategy, instrument: InstrumentCfg, seed_pnl: f64, seed_trades: u32) -> Self {
         Self {
             pos: None,
-            daily_pnl: 0.0, total_pnl: 0.0,
+            daily_pnl: seed_pnl, total_pnl: seed_pnl,
             trade_history: vec![],
             pnl_history: VecDeque::new(),
             equity_history: VecDeque::new(),
-            peak_pnl: 0.0, max_dd: 0.0,
+            peak_pnl: seed_pnl, max_dd: 0.0,
             peak_eod_balance: ACCOUNT_START_BALANCE,
-            trades_today: 0,
+            trades_today: seed_trades,
             lockdown_until: None,
             last_exit_bar: -999,
             cooldown_long_until: -999,
@@ -49,6 +58,14 @@ impl BotState {
             gutter_win: true, gutter_loss: true,
             account_name: None, account_id: None, contract_id: None,
             open_pnl: 0.0,
+            instrument,
+            strategy,
+            prev_above_vwap: false,
+            prev_z: 0.0,
+            prev_close: 0.0,
+            entry_signal_price: 0.0,
+            slippage_ticks: Vec::new(),
+            last_bar_idx: 0,
         }
     }
 
@@ -60,11 +77,43 @@ impl BotState {
     pub fn snapshot(&self, price: f64) -> BotSnapshot {
         let open_pnl = if let Some(ref pos) = self.pos {
             let ticks = match pos.dir {
-                Direction::Long => (price - pos.ep) / TICK_SIZE,
-                Direction::Short => (pos.ep - price) / TICK_SIZE,
+                Direction::Long => (price - pos.ep) / self.instrument.tick_size,
+                Direction::Short => (pos.ep - price) / self.instrument.tick_size,
             };
-            ticks * TICK_VALUE * pos.contracts_remaining as f64
+            ticks * self.instrument.tick_value * pos.contracts_remaining as f64
         } else { 0.0 };
+
+        let (hourly_pnl, _) = self.hourly_stats();
+        let is_locked_down = self.lockdown_until
+            .map(|u| u > std::time::Instant::now())
+            .unwrap_or(false);
+
+        let bot_state = if is_locked_down {
+            "HALTED".to_string()
+        } else if self.entry_pending {
+            "ENTERING".to_string()
+        } else if let Some(ref pos) = self.pos {
+            let trailing = match pos.dir {
+                Direction::Long  => pos.sl > pos.ep,
+                Direction::Short => pos.sl < pos.ep,
+            };
+            if trailing { format!("TRAILING_{}", pos.dir.as_str()) }
+            else        { format!("MANAGING_{}", pos.dir.as_str()) }
+        } else if self.cooldown_long_until >= self.last_bar_idx
+               || self.cooldown_short_until >= self.last_bar_idx
+        {
+            "COOLDOWN".to_string()
+        } else {
+            "HUNTING".to_string()
+        };
+
+        let avg_slippage_ticks = if self.slippage_ticks.is_empty() { 0.0 }
+            else { self.slippage_ticks.iter().sum::<f64>() / self.slippage_ticks.len() as f64 };
+
+        let pos_age_secs = self.pos.as_ref().map(|pos| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            now.saturating_sub(pos.created_at_secs)
+        }).unwrap_or(0);
 
         BotSnapshot {
             account_name: self.account_name.clone(),
@@ -74,9 +123,11 @@ impl BotState {
             max_dd: self.max_dd,
             trades_today: self.trades_today,
             pos: self.pos.as_ref().map(|p| PositionSnapshot {
+                uuid: p.uuid,
                 dir: p.dir.as_str().to_string(),
                 ep: p.ep, sl: p.sl, tp: p.tp,
                 contracts_remaining: p.contracts_remaining,
+                bar_idx: p.bar_idx,
             }),
             trade_history: self.trade_history.iter().rev().take(50).cloned().collect(),
             active_orders: vec![],
@@ -92,6 +143,12 @@ impl BotState {
             z_history: vec![],
             delta_history: vec![],
             atr_sparkline: vec![],
+            hourly_pnl,
+            is_locked_down,
+            strategy: self.strategy.name().to_string(),
+            bot_state,
+            avg_slippage_ticks,
+            pos_age_secs,
         }
     }
 
@@ -125,8 +182,8 @@ impl BotState {
     pub fn book_close(&mut self, price: f64, reason: &str, bar_idx: i64, size: u32, dir: &str) {
         let normalized = normalize_exit_reason(reason);
         let pos_ep = self.pos.as_ref().map(|p| p.ep).unwrap_or(price);
-        let ticks = if dir == "LONG" { (price - pos_ep) / TICK_SIZE } else { (pos_ep - price) / TICK_SIZE };
-        let gross_pnl = ticks * TICK_VALUE * size as f64;
+        let ticks = if dir == "LONG" { (price - pos_ep) / self.instrument.tick_size } else { (pos_ep - price) / self.instrument.tick_size };
+        let gross_pnl = ticks * self.instrument.tick_value * size as f64;
         let net_pnl = gross_pnl - COMMISSION_RT * size as f64;
 
         // Direction cooldown
@@ -141,7 +198,7 @@ impl BotState {
         self.daily_pnl += gross_pnl;
         self.trade_history.push(TradeRecord {
             action: "EXIT".to_string(), dir: dir.to_string(),
-            price, pnl: net_pnl, bar_idx, reason: normalized.clone(), size,
+            price, pnl: net_pnl, bar_idx, reason: normalized.clone(), size, sl: 0.0, tp: 0.0,
         });
 
         let now = std::time::Instant::now();
@@ -160,6 +217,7 @@ impl BotState {
         );
     }
 
+    #[allow(dead_code)]
     pub fn reset_for_new_day(&mut self) {
         self.trades_today = 0;
         self.daily_pnl = 0.0;
@@ -178,8 +236,12 @@ pub async fn run(
     cmd_tx: mpsc::Sender<TradeCommand>,
     mut fill_rx: mpsc::Receiver<FillEvent>,
     state: std::sync::Arc<tokio::sync::RwLock<AppState>>,
+    strategy: LiveStrategy,
+    instrument: InstrumentCfg,
+    seed_pnl: f64,
+    seed_trades: u32,
 ) {
-    let mut bot = BotState::new();
+    let mut bot = BotState::new(strategy, instrument, seed_pnl, seed_trades);
 
     loop {
         tokio::select! {
@@ -219,6 +281,16 @@ async fn handle_fill(bot: &mut BotState, fill: FillEvent) {
                 tracing::warn!("Got Entered fill but already have position — ignoring");
                 return;
             }
+            // Slippage: positive = filled better than signal, negative = paid more than signal
+            if bot.entry_signal_price > 0.0 {
+                let slip = match dir {
+                    Direction::Long  => (bot.entry_signal_price - fill_price) / bot.instrument.tick_size,
+                    Direction::Short => (fill_price - bot.entry_signal_price) / bot.instrument.tick_size,
+                };
+                bot.slippage_ticks.push(slip);
+                if bot.slippage_ticks.len() > 20 { bot.slippage_ticks.remove(0); }
+                bot.entry_signal_price = 0.0;
+            }
             let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             bot.pos = Some(Position {
                 uuid: pos_uuid, dir, ep: fill_price, sl, tp, bp: fill_price,
@@ -231,6 +303,7 @@ async fn handle_fill(bot: &mut BotState, fill: FillEvent) {
             bot.trade_history.push(TradeRecord {
                 action: "ENTER".to_string(), dir: dir.as_str().to_string(),
                 price: fill_price, pnl: 0.0, bar_idx, reason: String::new(), size: CONTRACTS,
+                sl, tp,
             });
             tracing::info!("ENTERED {dir:?} @ {fill_price:.2} SL={sl:.2} TP={tp:.2}");
         }
@@ -258,8 +331,8 @@ async fn handle_fill(bot: &mut BotState, fill: FillEvent) {
         FillEvent::ScaledOut { pos_uuid, fill_price, contracts_sold, bar_idx } => {
             if let Some(ref mut pos) = bot.pos {
                 if pos.uuid == pos_uuid {
-                    let ticks = (fill_price - pos.ep) / TICK_SIZE;
-                    let gross = ticks * TICK_VALUE * contracts_sold as f64;
+                    let ticks = (fill_price - pos.ep) / bot.instrument.tick_size;
+                    let gross = ticks * bot.instrument.tick_value * contracts_sold as f64;
                     let net = gross - COMMISSION_RT * contracts_sold as f64;
                     bot.total_pnl += gross; bot.daily_pnl += gross;
                     pos.contracts_remaining -= contracts_sold;
@@ -268,17 +341,27 @@ async fn handle_fill(bot: &mut BotState, fill: FillEvent) {
                     bot.trade_history.push(TradeRecord {
                         action: "EXIT".to_string(), dir: pos.dir.as_str().to_string(),
                         price: fill_price, pnl: net, bar_idx, reason: "SCALE OUT".to_string(),
-                        size: contracts_sold,
+                        size: contracts_sold, sl: 0.0, tp: 0.0,
                     });
                     tracing::info!("SCALE OUT {contracts_sold} @ {fill_price:.2} | Net: ${net:.2}");
                 }
             }
         }
-        FillEvent::ActiveOrders(orders) => {
+        FillEvent::ActiveOrders(_orders) => {
             // Stored in AppState by order manager — nothing to do here
         }
         FillEvent::Error(e) => {
             tracing::warn!("OrderManager error: {e}");
+            bot.entry_pending = false;
+        }
+        FillEvent::Rebase { pnl, trades } => {
+            if (pnl - bot.daily_pnl).abs() > 0.01 {
+                tracing::info!("P&L rebase: ${:.2} → ${:.2} (broker authoritative)", bot.daily_pnl, pnl);
+            }
+            bot.daily_pnl = pnl;
+            bot.total_pnl = pnl;
+            bot.trades_today = trades;
+            if pnl > bot.peak_pnl { bot.peak_pnl = pnl; }
         }
     }
 }
@@ -289,8 +372,17 @@ async fn handle_bar_event(
     cmd_tx: &mpsc::Sender<TradeCommand>,
     state: &std::sync::Arc<tokio::sync::RwLock<AppState>>,
 ) {
-    if !BOT_ACTIVE || !bar.rth { return; }
+    bot.last_bar_idx = bar.bar_idx;
+    if !bar.rth { return; }
     if bar.bar_idx < 15 || bar.std < 0.01 { return; }
+
+    // Sync runtime control flags from AppState (TUI-writable)
+    {
+        let st = state.read().await;
+        if !st.bot_enabled { return; }
+        bot.gutter_win  = st.bot.gutter_win;
+        bot.gutter_loss = st.bot.gutter_loss;
+    }
 
     // Update regime crossings
     {
@@ -316,45 +408,25 @@ async fn handle_bar_event(
         bot.lockdown_until = None;
     }
 
+    // Daily profit cap — TopStep consistency rule
+    if bot.daily_pnl >= bot.instrument.daily_profit_cap { return; }
+
+    // Advance tracking state unconditionally so crossing/z-score detection
+    // is accurate even after lunch gaps or ETH bars where we don't trade.
+    let vwap_prev_above = bot.prev_above_vwap;
+    let vwap_curr_above = bar.price >= bar.vwap;
+    bot.prev_above_vwap = vwap_curr_above;
+    let fp_prev_z     = bot.prev_z;
+    let fp_prev_close = bot.prev_close;
+    let fp_z = if bar.std > 0.01 { (bar.price - bar.vwap) / bar.std } else { 0.0 };
+    bot.prev_z     = fp_z;
+    bot.prev_close = bar.price;
+
     // Session filters
     if bar.tod_mins < 0 || bar.tod_mins >= POWER_HOUR_START { return; }
-    if bar.tod_mins >= LUNCH_SKIP_START && bar.tod_mins < LUNCH_SKIP_END { return; }
     if bot.trades_today >= MAX_TRADES { return; }
     if bot.entry_pending { return; }
     if bot.pos.is_some() { return; }
-
-    // Compute effective z threshold
-    let regime = state.read().await.regime.clone();
-    let mut z_thresh = Z_THRESH;
-    if regime.vwap_crossings <= VWAP_CROSS_TRENDING { z_thresh *= SESSION_TREND_Z_MULT; }
-    if regime.calendar_event.is_some() && HIGH_IMPACT_BEHAVIOR == "reduce" { z_thresh += 0.5; }
-    if let (Some(prev_vwap), Some(prev_vpoc)) = (regime.prev_vwap, regime.prev_vpoc) {
-        let near_prev = (bar.price - prev_vwap).abs() / TICK_SIZE <= PREV_LEVEL_TICKS
-            || (bar.price - prev_vpoc).abs() / TICK_SIZE <= PREV_LEVEL_TICKS;
-        if near_prev { z_thresh -= PREV_LEVEL_Z_BONUS; }
-    }
-    if regime.session_type == "TRENDING" { z_thresh *= SESSION_TREND_Z_MULT; }
-
-    let z = if bar.std > 0.01 { (bar.price - bar.vwap) / bar.std } else { 0.0 };
-    let abs_z = z.abs();
-    if abs_z < z_thresh { return; }
-    if bar.spread > MAX_SPREAD { return; }
-    if bar.vol_rel < MIN_VOL_REL { return; }
-    if bar.vwap_slope.abs() > VWAP_SLOPE_THRESH && bar.vwap_slope.signum() == z.signum() { return; }
-    if bar.sigma_exp > 2.5 { return; } // volatility panic filter
-
-    // Cumulative delta filter
-    if CUM_DELTA_FILTER && bar.cum_delta_pct.abs() > CUM_DELTA_FADE_MAX {
-        // Fading into a strong directional delta — skip
-        if (bar.cum_delta_pct > 0.0 && z < 0.0) || (bar.cum_delta_pct < 0.0 && z > 0.0) {
-            return;
-        }
-    }
-
-    // Direction cooldown
-    let dir = if z > 0.0 { Direction::Short } else { Direction::Long }; // mean-reversion: fade the z
-    if dir == Direction::Long && bar.bar_idx <= bot.cooldown_long_until { return; }
-    if dir == Direction::Short && bar.bar_idx <= bot.cooldown_short_until { return; }
 
     // Gutter daily loss guard
     let effective_dd = if bot.gutter_loss {
@@ -363,42 +435,105 @@ async fn handle_bar_event(
     } else { f64::MAX };
     if bot.daily_pnl <= -effective_dd { return; }
 
-    // ATR-based stop sizing
-    let atr = bar.atr.max(bar.std * 0.5);
-    let sl_dist = (atr * ATR_STOP_RATIO).max(MIN_STOP_TICKS as f64 * TICK_SIZE);
-    let sl_dist = sl_dist.min(MAX_STOP_TICKS as f64 * TICK_SIZE);
-    let sl_ticks = (sl_dist / TICK_SIZE).round() as i32;
+    // Strategy dispatch — use pre-captured tracking values from above
+    let strategy = bot.strategy.clone();
+    match strategy {
+        LiveStrategy::VwapReclaim => {
+            // Only act on crossover bars
+            let dir = if !vwap_prev_above && vwap_curr_above {
+                Direction::Short  // crossed above VWAP — fade the push up
+            } else if vwap_prev_above && !vwap_curr_above {
+                Direction::Long   // crossed below VWAP — fade the push down
+            } else {
+                return;
+            };
 
-    let (sl_price, tp_price) = match dir {
-        Direction::Long => {
-            let sl = bar.price - sl_ticks as f64 * TICK_SIZE;
-            let target = if TARGET_MODE == "vwap" {
-                (bar.vwap / TICK_SIZE).round() * TICK_SIZE
-            } else { bar.vpoc };
-            (sl, target)
+            if bot.entry_pending || bot.pos.is_some() { return; }
+            // Cooldown
+            if dir == Direction::Long && bar.bar_idx <= bot.cooldown_long_until { return; }
+            if dir == Direction::Short && bar.bar_idx <= bot.cooldown_short_until { return; }
+
+            let atr = bar.atr.max(bar.std * 0.5);
+            let tick_size = bot.instrument.tick_size;
+            let (sl_price, tp_price) = match dir {
+                Direction::Short => {
+                    let sl = bar.prev_h + 2.0 * tick_size;
+                    let tp = ((bar.vwap - atr) / tick_size).round() * tick_size;
+                    (sl, tp)
+                }
+                Direction::Long => {
+                    let sl = bar.prev_l - 2.0 * tick_size;
+                    let tp = ((bar.vwap + atr) / tick_size).round() * tick_size;
+                    (sl, tp)
+                }
+            };
+
+            let tp_buffer_ticks = (tp_price - bar.price).abs() / tick_size;
+            if tp_buffer_ticks < EXIT_MIN_TICKS { return; }
+            // Validate stop is on correct side
+            match dir {
+                Direction::Short => { if sl_price <= bar.price { return; } }
+                Direction::Long  => { if sl_price >= bar.price { return; } }
+            }
+
+            tracing::info!("VWAP RECLAIM {dir:?} | SL={sl_price:.2} TP={tp_price:.2} atr={atr:.2}");
+            bot.entry_signal_price = bar.price;
+            bot.entry_pending = true;
+            let _ = cmd_tx.send(TradeCommand::Enter {
+                dir, sl_price, tp_price, entry_price: bar.price,
+                entry_vwap: bar.vwap, tp_buffer_ticks, bar_idx: bar.bar_idx, atr,
+            }).await;
         }
-        Direction::Short => {
-            let sl = bar.price + sl_ticks as f64 * TICK_SIZE;
-            let target = if TARGET_MODE == "vwap" {
-                (bar.vwap / TICK_SIZE).round() * TICK_SIZE
-            } else { bar.vpoc };
-            (sl, target)
+
+        LiveStrategy::FirstPullback => {
+            // Use pre-captured values (fp_prev_z, fp_prev_close, fp_z from above)
+            if bot.entry_pending || bot.pos.is_some() { return; }
+
+            let z_thresh = Z_THRESH;
+            let atr = bar.atr.max(bar.std * 0.5);
+            let tick_size = bot.instrument.tick_size;
+            let sl_dist = (atr * ATR_STOP_RATIO)
+                .max(MIN_STOP_TICKS as f64 * tick_size)
+                .min(MAX_STOP_TICKS as f64 * tick_size);
+
+            let entry = if fp_prev_z > z_thresh * 1.5 && fp_z < fp_prev_z && fp_z > 0.1 {
+                // Was extended above VWAP, now pulling back toward VWAP → LONG
+                let sl = bar.vwap - sl_dist;
+                let raw_tp = fp_prev_close.max(bar.price + atr * 1.5);
+                let tp = (raw_tp / tick_size).round() * tick_size;
+                Some((Direction::Long, sl, tp))
+            } else if fp_prev_z < -z_thresh * 1.5 && fp_z > fp_prev_z && fp_z < -0.1 {
+                // Was extended below VWAP, now pulling back toward VWAP → SHORT
+                let sl = bar.vwap + sl_dist;
+                let raw_tp = fp_prev_close.min(bar.price - atr * 1.5);
+                let tp = (raw_tp / tick_size).round() * tick_size;
+                Some((Direction::Short, sl, tp))
+            } else {
+                None
+            };
+
+            let Some((dir, sl_price, tp_price)) = entry else { return; };
+
+            // Validate
+            match dir {
+                Direction::Short => { if sl_price <= bar.price { return; } }
+                Direction::Long  => { if sl_price >= bar.price { return; } }
+            }
+            let tp_buffer_ticks = (tp_price - bar.price).abs() / tick_size;
+            if tp_buffer_ticks < EXIT_MIN_TICKS { return; }
+
+            if dir == Direction::Long && bar.bar_idx <= bot.cooldown_long_until { return; }
+            if dir == Direction::Short && bar.bar_idx <= bot.cooldown_short_until { return; }
+
+            tracing::info!("FIRST PULLBACK {dir:?} | z={fp_z:.2} prev_z={fp_prev_z:.2} | SL={sl_price:.2} TP={tp_price:.2}");
+            bot.entry_signal_price = bar.price;
+            bot.entry_pending = true;
+            let _ = cmd_tx.send(TradeCommand::Enter {
+                dir, sl_price, tp_price, entry_price: bar.price,
+                entry_vwap: bar.vwap, tp_buffer_ticks, bar_idx: bar.bar_idx, atr,
+            }).await;
         }
-    };
-
-    let tp_buffer_ticks = (tp_price - bar.price).abs() / TICK_SIZE;
-    if tp_buffer_ticks < EXIT_MIN_TICKS { return; }
-
-    bot.entry_pending = true;
-    tracing::info!(
-        "SIGNAL {dir:?} | z={z:.2} z_thresh={z_thresh:.2} | SL={sl_price:.2} TP={tp_price:.2}"
-    );
-
-    let _ = cmd_tx.send(TradeCommand::Enter {
-        dir, sl_price, tp_price, entry_price: bar.price,
-        entry_vwap: bar.vwap, tp_buffer_ticks,
-        bar_idx: bar.bar_idx, atr,
-    }).await;
+    }
 }
 
 async fn handle_tick_event(
@@ -421,10 +556,10 @@ async fn handle_tick_event(
     // Update open PnL and drawdown tracking
     if let Some(ref pos) = bot.pos {
         let ticks = match pos.dir {
-            Direction::Long => (tick.price - pos.ep) / TICK_SIZE,
-            Direction::Short => (pos.ep - tick.price) / TICK_SIZE,
+            Direction::Long => (tick.price - pos.ep) / bot.instrument.tick_size,
+            Direction::Short => (pos.ep - tick.price) / bot.instrument.tick_size,
         };
-        let epnl = ticks * TICK_VALUE * pos.contracts_remaining as f64;
+        let epnl = ticks * bot.instrument.tick_value * pos.contracts_remaining as f64;
         bot.open_pnl = epnl;
         let cur_eq = bot.total_pnl + epnl;
         if cur_eq > bot.peak_pnl { bot.peak_pnl = cur_eq; }
@@ -438,13 +573,15 @@ async fn handle_tick_event(
     let ep = pos.ep;
     let sl = pos.sl;
     let tp = pos.tp;
-    let bp = pos.bp;
+    let _bp = pos.bp;
     let bt = tick.bar_idx - pos.bar_idx;
     let sz = pos.contracts_remaining;
     let scale1_done = pos.scale1_done;
     let entry_vwap = pos.entry_vwap;
     let tp_buffer_ticks = pos.tp_buffer_ticks;
     let price = tick.price;
+    let tick_size = bot.instrument.tick_size;
+    let tick_value = bot.instrument.tick_value;
 
     // Update best price
     if let Some(ref mut p) = bot.pos {
@@ -456,12 +593,12 @@ async fn handle_tick_event(
 
     let bp = bot.pos.as_ref().map(|p| p.bp).unwrap_or(ep);
     let ur = match dir {
-        Direction::Long => (bp - ep) / TICK_SIZE,
-        Direction::Short => (ep - bp) / TICK_SIZE,
+        Direction::Long => (bp - ep) / tick_size,
+        Direction::Short => (ep - bp) / tick_size,
     };
     let cur = match dir {
-        Direction::Long => (price - ep) / TICK_SIZE,
-        Direction::Short => (ep - price) / TICK_SIZE,
+        Direction::Long => (price - ep) / tick_size,
+        Direction::Short => (ep - price) / tick_size,
     };
 
     // Gutter logic
@@ -474,7 +611,7 @@ async fn handle_tick_event(
         Direction::Long => {
             // Gutter win
             if bot.gutter_win && bot.daily_pnl < GUTTER_GOAL {
-                let gut_tp = ep + ((GUTTER_GOAL - bot.daily_pnl) / (sz as f64 * TICK_VALUE)) * TICK_SIZE;
+                let gut_tp = ep + ((GUTTER_GOAL - bot.daily_pnl) / (sz as f64 * tick_value)) * tick_size;
                 if price >= gut_tp {
                     let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "GUTTER WIN".to_string(), price: gut_tp, bar_idx: tick.bar_idx }).await;
                     return;
@@ -482,9 +619,9 @@ async fn handle_tick_event(
             }
             // Gutter loss
             if bot.gutter_loss && bot.daily_pnl > -effective_dd {
-                let remaining = (bot.daily_pnl + effective_dd) / (sz as f64 * TICK_VALUE);
+                let remaining = (bot.daily_pnl + effective_dd) / (sz as f64 * tick_value);
                 if remaining > 0.0 {
-                    let gut_sl = ep - remaining * TICK_SIZE;
+                    let gut_sl = ep - remaining * tick_size;
                     if price <= gut_sl {
                         let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "GUTTER LOSS".to_string(), price: gut_sl, bar_idx: tick.bar_idx }).await;
                         return;
@@ -493,7 +630,7 @@ async fn handle_tick_event(
             }
             // Stop loss (local fallback)
             if !SERVER_BRACKETS_PRIMARY && price <= sl {
-                let reason = classify_stop("LONG", ep, sl);
+                let reason = classify_stop("LONG", ep, sl, tick_size);
                 let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason, price, bar_idx: tick.bar_idx }).await;
                 return;
             }
@@ -504,13 +641,13 @@ async fn handle_tick_event(
             }
             // Backup: bracket didn't fire
             if SERVER_BRACKETS_PRIMARY {
-                let sl_breach = (sl - price) / TICK_SIZE;
+                let sl_breach = (sl - price) / tick_size;
                 if sl_breach >= 2.0 {
-                    let reason = classify_stop("LONG", ep, sl);
+                    let reason = classify_stop("LONG", ep, sl, tick_size);
                     let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason, price, bar_idx: tick.bar_idx }).await;
                     return;
                 }
-                if price >= tp + 2.0 * TICK_SIZE && cur >= EXIT_MIN_TICKS {
+                if price >= tp + 2.0 * tick_size && cur >= EXIT_MIN_TICKS {
                     let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "TARGET".to_string(), price, bar_idx: tick.bar_idx }).await;
                     return;
                 }
@@ -521,7 +658,7 @@ async fn handle_tick_event(
             }
             // Trailing stop
             if ur >= TRAIL_ACTIVATE {
-                let tl = ((bp - TRAIL_DISTANCE * TICK_SIZE) / TICK_SIZE).round() * TICK_SIZE;
+                let tl = ((bp - TRAIL_DISTANCE * tick_size) / tick_size).round() * tick_size;
                 if tl > sl {
                     let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: tl }).await;
                 }
@@ -532,10 +669,10 @@ async fn handle_tick_event(
             }
             // TP drift update
             if entry_vwap > 0.0 && tp_buffer_ticks > 0.0 {
-                let drift_ticks = (tick.vwap - entry_vwap).abs() / TICK_SIZE;
+                let drift_ticks = (tick.vwap - entry_vwap).abs() / tick_size;
                 if drift_ticks >= 3.0 {
-                    let new_tp = ((tick.vwap + tp_buffer_ticks * TICK_SIZE) / TICK_SIZE).round() * TICK_SIZE;
-                    if (new_tp - tp).abs() >= TICK_SIZE {
+                    let new_tp = ((tick.vwap + tp_buffer_ticks * tick_size) / tick_size).round() * tick_size;
+                    if (new_tp - tp).abs() >= tick_size {
                         let _ = cmd_tx.send(TradeCommand::ModifyTp { pos_uuid, new_tp }).await;
                         if let Some(ref mut p) = bot.pos { p.entry_vwap = tick.vwap; }
                     }
@@ -553,7 +690,7 @@ async fn handle_tick_event(
         Direction::Short => {
             // Gutter win
             if bot.gutter_win && bot.daily_pnl < GUTTER_GOAL {
-                let gut_tp = ep - ((GUTTER_GOAL - bot.daily_pnl) / (sz as f64 * TICK_VALUE)) * TICK_SIZE;
+                let gut_tp = ep - ((GUTTER_GOAL - bot.daily_pnl) / (sz as f64 * tick_value)) * tick_size;
                 if price <= gut_tp {
                     let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "GUTTER WIN".to_string(), price: gut_tp, bar_idx: tick.bar_idx }).await;
                     return;
@@ -561,9 +698,9 @@ async fn handle_tick_event(
             }
             // Gutter loss
             if bot.gutter_loss && bot.daily_pnl > -effective_dd {
-                let remaining = (bot.daily_pnl + effective_dd) / (sz as f64 * TICK_VALUE);
+                let remaining = (bot.daily_pnl + effective_dd) / (sz as f64 * tick_value);
                 if remaining > 0.0 {
-                    let gut_sl = ep + remaining * TICK_SIZE;
+                    let gut_sl = ep + remaining * tick_size;
                     if price >= gut_sl {
                         let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "GUTTER LOSS".to_string(), price: gut_sl, bar_idx: tick.bar_idx }).await;
                         return;
@@ -571,7 +708,7 @@ async fn handle_tick_event(
                 }
             }
             if !SERVER_BRACKETS_PRIMARY && price >= sl {
-                let reason = classify_stop("SHORT", ep, sl);
+                let reason = classify_stop("SHORT", ep, sl, tick_size);
                 let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason, price, bar_idx: tick.bar_idx }).await;
                 return;
             }
@@ -580,13 +717,13 @@ async fn handle_tick_event(
                 return;
             }
             if SERVER_BRACKETS_PRIMARY {
-                let sl_breach = (price - sl) / TICK_SIZE;
+                let sl_breach = (price - sl) / tick_size;
                 if sl_breach >= 2.0 {
-                    let reason = classify_stop("SHORT", ep, sl);
+                    let reason = classify_stop("SHORT", ep, sl, tick_size);
                     let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason, price, bar_idx: tick.bar_idx }).await;
                     return;
                 }
-                if price <= tp - 2.0 * TICK_SIZE && cur >= EXIT_MIN_TICKS {
+                if price <= tp - 2.0 * tick_size && cur >= EXIT_MIN_TICKS {
                     let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "TARGET".to_string(), price, bar_idx: tick.bar_idx }).await;
                     return;
                 }
@@ -595,7 +732,7 @@ async fn handle_tick_event(
                 let _ = cmd_tx.send(TradeCommand::ScaleOut { pos_uuid, price, bar_idx: tick.bar_idx }).await;
             }
             if ur >= TRAIL_ACTIVATE {
-                let tl = ((bp + TRAIL_DISTANCE * TICK_SIZE) / TICK_SIZE).round() * TICK_SIZE;
+                let tl = ((bp + TRAIL_DISTANCE * tick_size) / tick_size).round() * tick_size;
                 if tl < sl {
                     let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: tl }).await;
                 }
@@ -610,8 +747,8 @@ async fn handle_tick_event(
     }
 }
 
-fn classify_stop(dir: &str, ep: f64, sl: f64) -> String {
-    let tol = TICK_SIZE * 0.25;
+fn classify_stop(dir: &str, ep: f64, sl: f64, tick_size: f64) -> String {
+    let tol = tick_size * 0.25;
     if (sl - ep).abs() <= tol { return "BREAKEVEN STOP".to_string(); }
     match dir {
         "LONG" => if sl > ep { "TRAIL STOP" } else { "STOP LOSS" },

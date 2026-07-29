@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::America::New_York;
 use reqwest::Client;
 use std::fs;
@@ -54,20 +54,13 @@ pub async fn backfill(client: &Client, bearer: &str) -> Result<()> {
         let is_today = *day == today;
         let path = Path::new(DATA_DIR).join(format!("{date_str}.json"));
 
-        // Use cache if complete and starts near RTH open
-        if !is_today && path.exists() {
-            if let Ok(sess) = Session::load(&date_str) {
-                if sess.bars.len() > 100 {
-                    let starts_ok = sess.bars.first().map(|b| {
-                        let et = b.ts.with_timezone(&New_York);
-                        et.hour() == 9 && et.minute() < 35
-                    }).unwrap_or(false);
-                    if starts_ok {
-                        tracing::info!("{date_str}: {} bars (cached)", sess.bars.len());
-                        continue;
-                    }
-                }
-            }
+        // Today's session is built live from the websocket feed; skip API fetch for today
+        if is_today { continue; }
+
+        // Prior session files are immutable — skip if already cached
+        if path.exists() {
+            tracing::debug!("{date_str}: cached, skipping");
+            continue;
         }
 
         let et_open = New_York
