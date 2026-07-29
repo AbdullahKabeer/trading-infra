@@ -1,0 +1,22 @@
+services:
+  es-bot:
+    build: .
+    image: es-bot:latest
+    container_name: es-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PROJECT_X_USERNAME=${PROJECT_X_USERNAME}
+      - PROJECT_X_API_KEY=${PROJECT_X_API_KEY}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      # Persist session data and tick recordings across restarts
+      - es_sessions:/app/es_sessions
+      - es_ticks:/app/es_ticks
+    # No TTY in compose → bot runs headless, web dashboard on :8080
+    tty: false
+
+volumes:
+  es_sessions:
+  es_ticks:
